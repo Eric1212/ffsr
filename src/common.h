@@ -45,6 +45,11 @@ void  log_close(void);                       /* ferme le fichier de log */
 /* Écrit une string JSON (échappé) dans b. Retourne 0 ou -1. */
 int   json_escape(Buf *b, const char *s, size_t n);
 
+/* Copie s (longueur n) dans b en DÉSÉCHAPPANT les séquences JSON
+ * (\" → ", \\ → \, \n → LF, …). Utilisé pour re-parser une string JSON
+ * qui a elle-même été échappée dans une valeur (script.evaluate). */
+int   json_unescape(Buf *b, const char *s, size_t n);
+
 /* Extraction brute d'un champ de premier niveau :
  *   {"id":1,"method":"x"}  →  JSON_STR  pour chaîne (mémoire interne)
  *   {"id":12,...}          →  nombre  via *num
@@ -54,6 +59,22 @@ typedef enum { JSON_NOTFOUND, JSON_STR, JSON_NUM } JsonVal;
 
 JsonVal json_get(const char *doc, size_t len, const char *key,
                  const char **str, long *num);
+
+/* Comme json_get, mais pour une string : retourne ses bornes [start,end)
+ * (les délimiteurs " exclus, la fin réelle avant le " fermant). */
+JsonVal json_get_str_bounds(const char *doc, size_t len, const char *key,
+                            size_t *start, size_t *end);
+
+/* Bornes [start,end) de la VALEUR du champ `key` de premier niveau.
+ * Retourne 1 trouvé, 0 pas trouvé, -1 malformé. */
+int json_value_bounds(const char *doc, size_t len, const char *key,
+                      size_t *start, size_t *end);
+
+/* Itérateur de tableau JSON : `pos` = position APRÈS le '[' (0 = début).
+ * À chaque appel, avance au sous-objet suivant et retourne ses bornes
+ * [start,end) ; retourne 0 quand le tableau est épuisé. */
+int json_array_next(const char *arr, size_t len, size_t *pos,
+                    size_t *start, size_t *end);
 
 /* ---------------------------------------------------------- utils */
 

@@ -175,6 +175,30 @@ int json_escape(Buf *b, const char *s, size_t n) {
   return 0;
 }
 
+int json_unescape(Buf *b, const char *s, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == '\\' && i + 1 < n) {
+      char nxt = s[++i];
+      switch (nxt) {
+        case '"':  if (buf_append(b, "\"", 1) != 0) return -1; break;
+        case '\\': if (buf_append(b, "\\", 1) != 0) return -1; break;
+        case 'n':  if (buf_append(b, "\n", 1) != 0) return -1; break;
+        case 't':  if (buf_append(b, "\t", 1) != 0) return -1; break;
+        case 'r':  if (buf_append(b, "\r", 1) != 0) return -1; break;
+        case 'b':  if (buf_append(b, "\b", 1) != 0) return -1; break;
+        case 'f':  if (buf_append(b, "\f", 1) != 0) return -1; break;
+        default:   /* \uXXXX : on garde brut (rare ici) */
+          if (buf_append(b, "\\", 1) != 0) return -1;
+          if (buf_append(b, &nxt, 1) != 0) return -1;
+      }
+    } else {
+      if (buf_append(b, (const char *)&c, 1) != 0) return -1;
+    }
+  }
+  return 0;
+}
+
 JsonVal json_get(const char *doc, size_t len, const char *key,
                  const char **str, long *num) {
   size_t klen = strlen(key);
@@ -230,8 +254,209 @@ JsonVal json_get(const char *doc, size_t len, const char *key,
       }
       continue;
     }
-    return JSON_NOTFOUND;
+    /* valeur : objet / tableau imbriqué (on saute sans chercher dedans) */
+    if (doc[i] == '{' || doc[i] == '[') {
+      char open = doc[i], close = open == '{' ? '}' : ']';
+      int depth = 0;
+      while (i < len) {
+        if (doc[i] == '"') {
+          i++;
+          while (i < len && doc[i] != '"') {
+            if (doc[i] == '\\') i++;
+            i++;
+          }
+        } else if (doc[i] == open) depth++;
+        else if (doc[i] == close) {
+          depth--;
+          if (depth == 0) { i++; break; }
+        }
+        i++;
+      }
+      continue;
+    }
+    /* valeur : littéral (null/true/false) */
+    {
+      size_t vs = i;
+      while (i < len && doc[i] != ',' && doc[i] != '}') i++;
+      size_t vl = i - vs;
+      if (klen == ke - ks && memcmp(doc + ks, key, klen) == 0) {
+        /* true/false → JSON_NUM (1/0) ; null → pas une valeur */
+        if ((vl == 4 && memcmp(doc + vs, "true", 4) == 0)) {
+          if (num) *num = 1;
+          return JSON_NUM;
+        }
+        if (vl == 5 && memcmp(doc + vs, "false", 5) == 0) {
+          if (num) *num = 0;
+          return JSON_NUM;
+        }
+        return JSON_NOTFOUND;
+      }
+      continue;
+    }
   }
+}
+
+/* ------------------------------------------------------- JSON bornes */
+
+JsonVal json_get_str_bounds(const char *doc, size_t len, const char *key,
+                            size_t *start, size_t *end) {
+  size_t klen = strlen(key);
+  size_t i = 0;
+  while (i < len && (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\n')) i++;
+  if (i >= len || doc[i] != '{') return JSON_NOTFOUND;
+  i++;
+  for (;;) {
+    while (i < len && (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\n'
+                       || doc[i] == ',')) i++;
+    if (i >= len || doc[i] != '"') return JSON_NOTFOUND;
+    i++;
+    size_t ks = i;
+    while (i < len && doc[i] != '"') i++;
+    if (i >= len) return JSON_NOTFOUND;
+    size_t ke = i;
+    i++;
+    while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
+    if (i >= len || doc[i] != ':') return JSON_NOTFOUND;
+    i++;
+    while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
+    if (i >= len) return JSON_NOTFOUND;
+    /* valeur non-string (null/littéral/objet/tableau) : on la saute et
+     * on continue — la clé cherchée peut être plus loin dans l'objet */
+    if (doc[i] != '"') {
+      if (doc[i] == '{' || doc[i] == '[') {
+        char open = doc[i], close = open == '{' ? '}' : ']';
+        int depth = 0;
+        while (i < len) {
+          if (doc[i] == '"') {
+            i++;
+            while (i < len && doc[i] != '"') {
+              if (doc[i] == '\\') i++;
+              i++;
+            }
+          } else if (doc[i] == open) depth++;
+          else if (doc[i] == close) {
+            depth--;
+            if (depth == 0) { i++; break; }
+          }
+          i++;
+        }
+      } else {
+        while (i < len && doc[i] != ',' && doc[i] != '}') i++;
+      }
+      continue;
+    }
+    i++;
+    size_t vs = i;
+    while (i < len && doc[i] != '"') {
+      if (doc[i] == '\\') i++;
+      i++;
+    }
+    if (i >= len) return JSON_NOTFOUND;
+    if (klen == ke - ks && memcmp(doc + ks, key, klen) == 0) {
+      if (start) *start = vs;
+      if (end) *end = i;
+      return JSON_STR;
+    }
+    i++;
+    continue;
+  }
+}
+
+/* Localise la valeur du champ `key` de premier niveau : bornes [start,end). */
+int json_value_bounds(const char *doc, size_t len, const char *key,
+                      size_t *start, size_t *end) {
+  size_t klen = strlen(key);
+  size_t i = 0;
+  while (i < len && (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\n')) i++;
+  if (i >= len || doc[i] != '{') return -1;
+  i++;
+  for (;;) {
+    while (i < len && (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\n'
+                       || doc[i] == ',')) i++;
+    if (i >= len || doc[i] != '"') return -1;
+    i++;
+    size_t ks = i;
+    while (i < len && doc[i] != '"') i++;
+    if (i >= len) return -1;
+    size_t ke = i;
+    i++;
+    while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
+    if (i >= len || doc[i] != ':') return -1;
+    i++;
+    while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
+    if (i >= len) return -1;
+    /* valeur : string, nombre, objet, tableau ou littéral */
+    size_t vs = i, ve = vs;
+    if (doc[i] == '"') {
+      i++;
+      vs = i;
+      while (i < len && doc[i] != '"') {
+        if (doc[i] == '\\') i++;
+        i++;
+      }
+      ve = i;
+      i++; /* ferme la string */
+    } else if (doc[i] == '{' || doc[i] == '[') {
+      char open = doc[i], close = open == '{' ? '}' : ']';
+      int depth = 0;
+      while (i < len) {
+        if (doc[i] == '"') {
+          i++;
+          while (i < len && doc[i] != '"') {
+            if (doc[i] == '\\') i++;
+            i++;
+          }
+        } else if (doc[i] == open) depth++;
+        else if (doc[i] == close) {
+          depth--;
+          if (depth == 0) { ve = i + 1; i++; break; }
+        }
+        i++;
+      }
+      if (depth != 0) return -1;
+    } else {
+      while (i < len && doc[i] != ',' && doc[i] != '}') i++;
+      ve = i;
+    }
+    if (klen == ke - ks && memcmp(doc + ks, key, klen) == 0) {
+      if (start) *start = vs;
+      if (end) *end = ve;
+      return 1;
+    }
+  }
+}
+
+/* Itérateur de tableau : `pos` doit démarrer à la position après '['.
+ * Retourne 0 (fini), 1 (élément trouvé dans [start,end)), -1 (malformé). */
+int json_array_next(const char *arr, size_t len, size_t *pos,
+                    size_t *start, size_t *end) {
+  size_t i = *pos;
+  while (i < len && (arr[i] == ' ' || arr[i] == '\t' || arr[i] == '\n'
+                     || arr[i] == ',')) i++;
+  if (i >= len || arr[i] == ']') { *pos = i; return 0; }
+  if (arr[i] != '{') return -1;
+  int depth = 0;
+  size_t s = i;
+  while (i < len) {
+    if (arr[i] == '"') {
+      i++;
+      while (i < len && arr[i] != '"') {
+        if (arr[i] == '\\') i++;
+        i++;
+      }
+    } else if (arr[i] == '{') depth++;
+    else if (arr[i] == '}') {
+      depth--;
+      if (depth == 0) {
+        *start = s;
+        *end = i + 1;
+        *pos = i + 1;
+        return 1;
+      }
+    }
+    i++;
+  }
+  return -1;
 }
 
 /* ---------------------------------------------------------- utils */

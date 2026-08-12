@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -546,6 +547,207 @@ static void shutdown_daemon(int code) {
   exit(code);
 }
 
+/* --------------------------------------------------- état persistant */
+
+/* /var/lib/ffsrd/state — MÉMOIRE DE SURVIE du daemon (jamais une
+ * interface CLI) : hint fenêtre + mapping tab0-9 → contextId, pour la
+ * réconciliation au démarrage. Firefox reste la SOURCE DE VÉRITÉ. */
+#define MAX_TABS       10
+#define STATE_PATH     "/var/lib/ffsrd/state"
+
+static char g_win_hint[64];
+static char g_tabs[MAX_TABS][64];
+static int  g_nbtabs = 0;
+
+static void state_load(void) {
+  g_nbtabs = 0;
+  g_win_hint[0] = '\0';
+  for (int i = 0; i < MAX_TABS; i++) g_tabs[i][0] = '\0';
+  FILE *f = fopen(STATE_PATH, "r");
+  if (!f) return;
+  char line[160];
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
+    char *eq = strchr(line, '=');
+    if (!eq) continue;
+    char *val = eq + 1;
+    if (strncmp(line, "window=", 7) == 0) {
+      snprintf(g_win_hint, sizeof(g_win_hint), "%s", val);
+    } else if (strncmp(line, "tab", 3) == 0 && isdigit((unsigned char)line[3])
+               && line[4] == '=') {
+      int idx = line[3] - '0';
+      if (idx >= 0 && idx < MAX_TABS) {
+        snprintf(g_tabs[idx], sizeof(g_tabs[idx]), "%s", val);
+        if (val[0] && idx + 1 > g_nbtabs) g_nbtabs = idx + 1;
+      }
+    }
+  }
+  fclose(f);
+}
+
+/* write-through atomique : state.tmp puis rename (pas de fichier corrompu
+ * si crash en plein écriture). Appelée après chaque mutation. */
+static void state_save(void) {
+  char tmp[512];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", STATE_PATH);
+  FILE *f = fopen(tmp, "w");
+  if (!f) { log_err("state: ouverture %s: %s", tmp, strerror(errno)); return; }
+  fprintf(f, "window=%s\n", g_win_hint);
+  for (int i = 0; i < MAX_TABS; i++)
+    fprintf(f, "tab%d=%s\n", i, g_tabs[i]);
+  fprintf(f, "nbtabs=%d\n", g_nbtabs);
+  fclose(f);
+  if (rename(tmp, STATE_PATH) != 0)
+    log_err("state: rename %s: %s", tmp, strerror(errno));
+}
+
+/* ------------------------------------------------- bidi côté daemon */
+
+/* Commande + attente de la réponse (toute la mécanique daemon passe ici).
+ * Retourne la réponse allouée (à free) ou NULL. */
+static char *bidi_call(const char *method, const char *params_json) {
+  if (ws_command(method, params_json) != 0) return NULL;
+  const char *rep = ws_wait_daemon_response(5000);
+  if (!rep) { log_err("bidi_call %s: pas de réponse", method); return NULL; }
+  return (char *)rep;   /* déjà alloué par ws_wait_daemon_response */
+}
+
+/* Extrait une string de premier niveau DANS "result" (ex. context,
+ * clientWindow). Retourne 0 ou -1. */
+static int get_result_str(const char *doc, const char *key,
+                          char *out, size_t outsz) {
+  size_t rs = 0, re = 0, vs = 0, ve = 0;
+  if (json_value_bounds(doc, strlen(doc), "result", &rs, &re) != 1) return -1;
+  if (json_get_str_bounds(doc + rs, re - rs, key, &vs, &ve) != JSON_STR) return -1;
+  size_t l = ve - vs < outsz - 1 ? ve - vs : outsz - 1;
+  memcpy(out, doc + rs + vs, l);
+  out[l] = '\0';
+  return 0;
+}
+
+/* Liste les contextIds de premier niveau du getTree (max max items). */
+static int get_context_list(const char *doc, char list[][64], int max) {
+  size_t rs = 0, re = 0, cs = 0, ce = 0;
+  if (json_value_bounds(doc, strlen(doc), "result", &rs, &re) != 1) return 0;
+  if (json_value_bounds(doc + rs, re - rs, "contexts", &cs, &ce) != 1) return 0;
+  const char *arr = doc + rs + cs;
+  size_t alen = ce - cs;
+  size_t pos = 1, s = 0, e = 0;
+  int n = 0;
+  while (n < max && json_array_next(arr, alen, &pos, &s, &e) > 0) {
+    size_t vs = 0, ve = 0;
+    if (json_get_str_bounds(arr + s, e - s, "context", &vs, &ve) == JSON_STR) {
+      size_t l = ve - vs < 63 ? ve - vs : 63;
+      memcpy(list[n], arr + s + vs, l);
+      list[n][l] = '\0';
+      n++;
+    }
+  }
+  return n;
+}
+
+/* ----------------------------------- fenêtre dédiée (prérequis n°1) */
+
+/* Crée LA fenêtre dédiée visible + les 9 onglets (matrice pleine 0-9,
+ * tous about:blank, ordre figé). Le daemon est le SEUL créateur. */
+static int dedicated_window_create(void) {
+  /* la fenêtre (l'onglet 0 naît avec elle — visible par défaut) */
+  char *rep = bidi_call("browsingContext.create",
+                        "{\"type\":\"window\",\"referenceContext\":null}");
+  if (!rep) return -1;
+  if (get_result_str(rep, "context", g_tabs[0], sizeof(g_tabs[0])) != 0) {
+    log_err("create window: réponse sans context: %s", rep);
+    free(rep);
+    return -1;
+  }
+  free(rep);
+
+  /* 9 onglets, toujours DANS la fenêtre dédiée (referenceContext=onglet 0
+   * → jamais dans une fenêtre personnelle même si une autre est active) */
+  for (int i = 1; i < MAX_TABS; i++) {
+    char params[160];
+    snprintf(params, sizeof(params),
+             "{\"type\":\"tab\",\"referenceContext\":\"%s\"}", g_tabs[0]);
+    rep = bidi_call("browsingContext.create", params);
+    if (!rep) return -1;
+    if (get_result_str(rep, "context", g_tabs[i], sizeof(g_tabs[i])) != 0) {
+      log_err("create tab %d: réponse sans context: %s", i, rep);
+      free(rep);
+      return -1;
+    }
+    free(rep);
+  }
+  g_nbtabs = MAX_TABS;
+
+  /* VÉRIFICATION DE VISIBILITÉ : la fenêtre dédiée doit être visible et
+   * active — browser.getClientWindows (jamais un ID mémorisé : Firefox
+   * les rotate, on cherche active=true à chaque fois) */
+  rep = bidi_call("browser.getClientWindows", NULL);
+  if (rep) {
+    size_t rs = 0, re = 0, cs = 0, ce = 0;
+    if (json_value_bounds(rep, strlen(rep), "result", &rs, &re) == 1
+        && json_value_bounds(rep + rs, re - rs, "clientWindows", &cs, &ce) == 1) {
+      const char *arr = rep + rs + cs;
+      size_t pos = 1, s = 0, e = 0;
+      while (json_array_next(arr, ce - cs, &pos, &s, &e) > 0) {
+        size_t vs = 0, ve = 0;
+        long active = 0;
+        if (json_get(arr + s, e - s, "active", NULL, &active) == JSON_NUM
+            && active) {
+          if (json_get_str_bounds(arr + s, e - s, "clientWindow", &vs, &ve)
+              == JSON_STR) {
+            size_t l = ve - vs < sizeof(g_win_hint) - 1 ? ve - vs
+                                                       : sizeof(g_win_hint) - 1;
+            memcpy(g_win_hint, arr + s + vs, l);
+            g_win_hint[l] = '\0';
+          }
+          /* état visible : state=normal (page visible) */
+          long state = 0;
+          json_get(arr + s, e - s, "state", NULL, &state);
+          log_msg("fenêtre dédiée visible (active, state=%ld, clientWindow=%s)",
+                  state, g_win_hint);
+          break;
+        }
+      }
+    }
+    free(rep);
+  }
+  state_save();
+  log_msg("fenêtre dédiée créée : %d onglets about:blank (0=%s)", g_nbtabs,
+          g_tabs[0]);
+  return 0;
+}
+
+/* Réconciliation au démarrage : matrice saine (10 onglets vivants dans
+ * l'ordre) → rien à faire ; sinon TOUT recréer (un onglet remplacé
+ * tomberait en fin d'ordre interne et casserait le mapping par position
+ * du CLI — décision : tout-ou-rien). */
+static int dedicated_window_ensure(void) {
+  state_load();
+  char *rep = bidi_call("browsingContext.getTree", "{\"maxDepth\":0}");
+  if (!rep) return -1;
+  char alive[32][64];
+  int nalive = get_context_list(rep, alive, 32);
+  free(rep);
+
+  int ok = g_nbtabs == MAX_TABS && g_tabs[0][0];
+  for (int i = 0; ok && i < MAX_TABS; i++) {
+    int found = 0;
+    for (int j = 0; j < nalive; j++)
+      if (strcmp(g_tabs[i], alive[j]) == 0) { found = 1; break; }
+    if (!found) ok = 0;
+  }
+  if (ok) {
+    log_msg("fenêtre dédiée présente (matrice %d/10 saine, window=%s)",
+            g_nbtabs, g_win_hint);
+    return 0;
+  }
+  log_msg("fenêtre dédiée absente ou matrice incomplète — création (nbtabs=%d)",
+          g_nbtabs);
+  return dedicated_window_create();
+}
+
 /* --------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
@@ -587,6 +789,13 @@ int main(int argc, char **argv) {
     log_err("échec de la liaison WS — ffsrd ne démarre pas (pont down ?)");
     /* Si le WS est connecté (g_ws_alive), session.end sera tenté :
      * pas de session créée sans être rendue. */
+    shutdown_daemon(EXIT_ERR);
+  }
+
+  /* fenêtre dédiée AVANT d'écouter : le prérequis n°1 de fiabilité —
+   * le daemon est le SEUL créateur (window + 10 onglets about:blank). */
+  if (dedicated_window_ensure() != 0) {
+    log_err("échec de l'init de la fenêtre dédiée — ffsrd ne démarre pas");
     shutdown_daemon(EXIT_ERR);
   }
 
