@@ -278,6 +278,21 @@ static int cmd_tabs(void) {
   return EXIT_OK;
 }
 
+/* Détecte un schéma de protocole au début de l'URL ([a-z][a-z0-9+.-]*:).
+ * "example.org" → non ; "https://…" / "about:blank" / "data:…" → oui. */
+static int has_scheme(const char *url) {
+  if (!((url[0] >= 'a' && url[0] <= 'z') ||
+        (url[0] >= 'A' && url[0] <= 'Z')))
+    return 0;
+  for (const char *p = url + 1; *p; p++) {
+    if (*p == ':') return 1;
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+          (*p >= '0' && *p <= '9') || *p == '+' || *p == '-' || *p == '.'))
+      return 0;
+  }
+  return 0;
+}
+
 /* ffsr go <N> <url> [w] — navigue l'onglet N de la fenêtre dédiée.
  * Sans 'w' : wait:none (réponse immédiate, prompt rendu tout de suite).
  * Avec 'w'  : wait:interactive — la commande ne rend le prompt qu'une
@@ -299,10 +314,19 @@ static int cmd_go(int n, const char *url, int want_wait) {
     return EXIT_BADARGS;
   }
 
+  /* Décision 2026-08-12 : schéma de protocole absent → https:// préfixé ;
+   * présent (http, file, about, data…) → l'input est pris tel quel. */
+  char fixed[4120];
+  const char *target = url;
+  if (!has_scheme(url)) {
+    snprintf(fixed, sizeof(fixed), "https://%s", url);
+    target = fixed;
+  }
+
   /* URL échappée pour le JSON */
   char eurl[4096];
   size_t o = 0;
-  for (const char *p = url; *p && o + 6 < sizeof(eurl); p++) {
+  for (const char *p = target; *p && o + 6 < sizeof(eurl); p++) {
     switch (*p) {
       case '"':  eurl[o++] = '\\'; eurl[o++] = '"';  break;
       case '\\': eurl[o++] = '\\'; eurl[o++] = '\\'; break;
@@ -377,7 +401,7 @@ int main(int argc, char **argv) {
   /* ffsr tabs — la liste des onglets */
   if (strcmp(argv[1], "tabs") == 0) return cmd_tabs();
 
-  /* ffsr go <N> <url> [w] — navigue l'onglet N de la fenêtre dédiée.
+/* ffsr go <N> <url> [w] — navigue l'onglet N de la fenêtre dédiée.
    * 'w' = wait:interactive (la commande rend le prompt quand le DOM
    * est prêt) ; sans 'w' = wait:none (réponse immédiate). */
   if (strcmp(argv[1], "go") == 0) {
