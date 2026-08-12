@@ -35,6 +35,7 @@
 #define SOCK_MODE       0660             /* rw: possesseur + groupe sudo */
 #define WS_URL          "ws://127.0.0.1:9222/session"
 #define HANDSHAKE_TO    5000             /* ms d'attente réponse démarrage */
+#define LOG_PATH        "/var/lib/ffsrd/ffsrd.log"
 
 /* ------------------------------------------------------- table routage */
 
@@ -553,6 +554,17 @@ int main(int argc, char **argv) {
   if (getuid() != 0) {
     log_err("ffsrd doit tourner root (service systemd)");
     return EXIT_ERR;
+  }
+
+  /* log fichier (rotation 1 Mo intégrée) : le journal système ne filtre
+   * que le grave — le log du daemon est notre source fiable. */
+  {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s", LOG_PATH);
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = '\0'; mkdir_p(dir); }
+    log_set_file(LOG_PATH);
+    log_msg("=== ffsrd démarre (pid %d) ===", getpid());
   }
 
   if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {

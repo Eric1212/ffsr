@@ -37,6 +37,8 @@ void   buf_reset(Buf *b);
 
 void  log_msg(const char *fmt, ...);         /* stderr, préfixe [ffsr] */
 void  log_err(const char *fmt, ...);         /* stderr, préfixe [ffsr] err: */
+void  log_set_file(const char *path);        /* daemon : fichier + stderr, rotation 1 Mo */
+void  log_close(void);                       /* ferme le fichier de log */
 
 /* ------------------------------------------------------- JSON minimal */
 

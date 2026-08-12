@@ -9,7 +9,10 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <time.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------- buffers */
 
@@ -70,22 +73,80 @@ void buf_reset(Buf *b) {
 
 /* -------------------------------------------------------------- log */
 
+/* Fichier de log du daemon (NULL = stderr uniquement).
+ * Ouvert par log_set_file(); écrit avant stderr, timestampé.
+ * Rotation (trimmer) : dès que le fichier dépasse LOG_MAX_BYTES, il est
+ * renommé en "<path>.old" (en écrasant l'ancien .old) et on repart à
+ * neuf — le fichier de log est toujours borné ~2× la limite. */
+#define LOG_MAX_BYTES (1024 * 1024)     /* 1 Mo avant rotation */
+
+static FILE *g_log_fp = NULL;
+static char  g_log_path[512] = "";
+
+void log_set_file(const char *path) {
+  if (g_log_fp) { fclose(g_log_fp); g_log_fp = NULL; }
+  g_log_path[0] = '\0';
+  if (path) {
+    snprintf(g_log_path, sizeof(g_log_path), "%s", path);
+    g_log_fp = fopen(path, "a");
+  }
+}
+
+void log_close(void) {
+  if (g_log_fp) { fclose(g_log_fp); g_log_fp = NULL; }
+}
+
+static void log_rotate_if_needed(void) {
+  if (!g_log_fp || !g_log_path[0]) return;
+  struct stat st;
+  if (fstat(fileno(g_log_fp), &st) != 0) return;
+  if (st.st_size < LOG_MAX_BYTES) return;
+
+  fclose(g_log_fp);
+  char old[sizeof(g_log_path) + 4];
+  snprintf(old, sizeof(old), "%s.old", g_log_path);
+  /* rename écrase silencieusement un éventuel .old précédent */
+  rename(g_log_path, old);
+  g_log_fp = fopen(g_log_path, "a");   /* fichier neuf */
+  if (g_log_fp) {
+    fprintf(g_log_fp, "--- rotation (ancien log dans %s) ---\n", old);
+  }
+}
+
+static void log_write(const char *tag, const char *fmt, va_list ap) {
+  if (g_log_fp) {
+    va_list apf;
+    va_copy(apf, ap);   /* COPIE avant tout usage : ap doit rester intact */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm;
+    localtime_r(&tv.tv_sec, &tm);
+    fprintf(g_log_fp, "%02d-%02d %02d:%02d:%02d.%03d [%s] ",
+            tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+            (int)(tv.tv_usec / 1000), tag);
+    vfprintf(g_log_fp, fmt, apf);
+    va_end(apf);
+    fputc('\n', g_log_fp);
+    fflush(g_log_fp); /* crash-safe : la ligne est écrite même en kill -9 */
+    log_rotate_if_needed();
+  }
+  fprintf(stderr, "[ffsr] %s", tag);
+  vfprintf(stderr, fmt, ap);   /* ap n'a JAMAIS été consommé : intact */
+  fputc('\n', stderr);
+}
+
 void log_msg(const char *fmt, ...) {
   va_list ap;
-  fprintf(stderr, "[ffsr] ");
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  log_write("", fmt, ap);
   va_end(ap);
-  fputc('\n', stderr);
 }
 
 void log_err(const char *fmt, ...) {
   va_list ap;
-  fprintf(stderr, "[ffsr] err: ");
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  log_write("err: ", fmt, ap);
   va_end(ap);
-  fputc('\n', stderr);
 }
 
 /* ------------------------------------------------------- JSON minimal */

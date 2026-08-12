@@ -32,7 +32,10 @@ install: all
 	install -m 0644 etc/ffsrd.conf $(DESTDIR)$(CONFDIR)/conf
 	@echo "==> systemctl daemon-reload && systemctl enable --now ffsrd"
 	-systemctl daemon-reload
-	-systemctl enable --now ffsrd.service
+	-systemctl enable ffsrd.service
+	# restart (pas --now) : un service déjà actif garde l'ANCIEN binaire en
+	# mémoire — chaque make install doit être effectif immédiatement.
+	-systemctl restart ffsrd.service
 
 uninstall:
 	-rm -f $(DESTDIR)$(BINDIR)/ffsr $(DESTDIR)$(BINDIR)/ffsrd
