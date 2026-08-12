@@ -554,9 +554,9 @@ static int evaluate_ctx_t(const char *ctx, const char *expression, Buf *out,
            "\"target\":{\"context\":\"%.63s\"},"
            "\"awaitPromise\":false,\"resultOwnership\":\"none\"}}",
            expression, ctx);
-  Buf raw;
-  if (cli_call_t(trame, &raw, timeout_s) != EXIT_OK) return -1;
-  size_t vs = 0, ve = 0;
+   Buf raw;
+   if (cli_call_t(trame, &raw, timeout_s) != EXIT_OK) return -1;
+   size_t vs = 0, ve = 0;
   if (get_script_value(raw.data, raw.len, &vs, &ve) != 0) {
     log_err("script.evaluate: unexpected response");
     buf_free(&raw);
@@ -766,6 +766,114 @@ static int cmd_get_file(int n, int want_wait, int src) {
   return EXIT_OK;
 }
 
+/* ------------------------------------------------------- screen */
+
+/* Décode du base64 standard (A-Za-z0-9+/=) dans out. 0 ou -1. */
+static int base64_decode(const char *s, size_t n, Buf *out) {
+  int val = 0, bits = 0;
+  for (size_t i = 0; i < n; i++) {
+    int d;
+    char c = s[i];
+    if (c >= 'A' && c <= 'Z') d = c - 'A';
+    else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
+    else if (c >= '0' && c <= '9') d = c - '0' + 52;
+    else if (c == '+') d = 62;
+    else if (c == '/') d = 63;
+    else if (c == '=') break;
+    else continue;
+    val = (val << 6) | d;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      char b = (char)((val >> bits) & 0xFF);
+      if (buf_append(out, &b, 1) != 0) return -1;
+    }
+  }
+  return 0;
+}
+
+/* ffsr screen <N> — capture WebP du viewport de l'onglet N, servie EXACT
+ * sur stdout (aucun dossier : redirection shell, même philosophie que
+ * get file). La capture exige une page VISIBLE — le pont attend
+ * indéfiniment sinon (découvert 2026-08-12) : browsingContext.activate
+ * d'abord, puis captureScreenshot (webp 0.8, réponse en ~0,1 s). */
+static int cmd_screen(int n) {
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    log_err("dedicated window not found — no tabs?");
+    return EXIT_ERR;
+  }
+  if (n >= count) {
+    log_err("tab %d out of range: dedicated window has %d tab(s)", n, count);
+    return EXIT_BADARGS;
+  }
+  Buf out;
+  buf_init(&out);
+  char trame[700];
+  /* Step 1: activate — brings the browsing context to the foreground so
+   * the bridge knows it's visible (captureScreenshot waits indefinitely
+   * otherwise — confirmed 2026-08-12). */
+  snprintf(trame, sizeof(trame),
+           "{\"id\":8,\"method\":\"browsingContext.activate\","
+           "\"params\":{\"context\":\"%.63s\"}}", ctxs[n]);
+  if (cli_call(trame, &out) != EXIT_OK) {
+    log_err("screen: activate failed");
+    buf_free(&out);
+    return EXIT_ERR;
+  }
+  buf_reset(&out);
+  /* Step 2: scroll to top + stop ongoing loads. Heavy search-result pages
+   * keep Firefox busy rendering (lazy images, video, XHR) → the animation
+   * frame callback that captureScreenshot waits for never fires within
+   * the 10 s deadline. Scrolling to (0,0) ensures already-rendered content
+   * is in the viewport; window.stop() kills dangling requests. Both are
+   * no-ops if the page is already idle/complete. */
+  if (evaluate_ctx(ctxs[n], "window.scrollTo(0,0);window.stop();'ok'", &out) != 0) {
+    log_msg("screen: scroll/stop returned non-string (non-fatal)");
+  }
+  buf_reset(&out);
+  /* Step 3: captureScreenshot (webp 0.8) — 10 s deadline per spec. */
+  snprintf(trame, sizeof(trame),
+           "{\"id\":9,\"method\":\"browsingContext.captureScreenshot\","
+           "\"params\":{\"context\":\"%.63s\",\"format\":{"
+           "\"type\":\"image/webp\",\"quality\":0.8}}}", ctxs[n]);
+  if (cli_call(trame, &out) != EXIT_OK) {
+    buf_free(&out);
+    return EXIT_ERR;
+  }
+  /* Extract "result" first, then find "data" inside it — the
+   * captureScreenshot response nests data inside result:
+   * {"type":"success","id":9,"result":{"data":"<b64>"}}
+   * (json_get_str_bounds only scans top-level keys.) */
+  size_t rs = 0, re = 0;
+  if (json_value_bounds(out.data, out.len, "result", &rs, &re) != 1) {
+    log_err("screen: no \"result\" in capture response");
+    buf_free(&out);
+    return EXIT_ERR;
+  }
+  size_t start, end;
+  if (json_get_str_bounds(out.data + rs, re - rs, "data", &start, &end) != JSON_STR) {
+    log_err("screen: no \"data\" field in capture response");
+    buf_free(&out);
+    return EXIT_ERR;
+  }
+  Buf img;
+  buf_init(&img);
+  if (base64_decode(out.data + rs + start, end - start, &img) != 0 || img.len == 0) {
+    log_err("screen: base64 decode failed");
+    buf_free(&out);
+    buf_free(&img);
+    return EXIT_ERR;
+  }
+  if (img.len > 0) fwrite(img.data, 1, img.len, stdout);
+  buf_free(&out);
+  buf_free(&img);
+  return EXIT_OK;
+}
+
 /* ------------------------------------------------------- get con */
 
 /* Mini-parseur JSON : sépare les trames du flux du stream (string-aware :
@@ -846,7 +954,7 @@ static int cmd_get_con(int n) {
   return EXIT_OK;
 }
 
-/* ffsr get [html|txt|net|child|file|con] <N> [w] [-src] — LE socle groupé
+/* ffsr get [html|txt|net|child|file|con] <N> [-src] [w]— LE socle groupé
  * des extractions (HTML, texte visible, instantané réseau = la même
  * mécanique, seule l'expression change ; child = boucle des iframes ;
  * file = canal binaire blob/source ; con = stream console). Sortie
@@ -1056,6 +1164,20 @@ int main(int argc, char **argv) {
   }
 
   /* ffsr f5 <N> [w] — hard reload (cache bypass) of tab N */
+  if (strcmp(argv[1], "screen") == 0) {
+    if (argc != 3) {
+      log_err("usage: ffsr screen <N 0-9>");
+      return EXIT_BADARGS;
+    }
+    char *end = NULL;
+    long n = strtol(argv[2], &end, 10);
+    if (!end || *end != '\0' || n < 0 || n > 9) {
+      log_err("N must be an integer between 0 and 9");
+      return EXIT_BADARGS;
+    }
+    return cmd_screen((int)n);
+  }
+
   if (strcmp(argv[1], "f5") == 0) {
     if (argc < 3 || argc > 4) {
       log_err("usage: ffsr f5 <N 0-9> [w]");

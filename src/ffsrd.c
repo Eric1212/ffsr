@@ -567,37 +567,31 @@ static void relay_message(const char *data, size_t len) {
 
 static void ws_to_clients(void) {
   char buf[16384];
-  size_t n = sizeof(buf);
   const struct curl_ws_frame *meta = NULL;
-  CURLcode rc = curl_ws_recv(g_curl, buf, n, &n, &meta);
-  if (rc == CURLE_AGAIN) return;
-  if (rc != CURLE_OK) {
-    log_err("curl_ws_recv: %s", curl_easy_strerror(rc));
-    return;
+  for (;;) {
+    size_t n = sizeof(buf);
+    CURLcode rc = curl_ws_recv(g_curl, buf, n, &n, &meta);
+    if (rc == CURLE_AGAIN) return;           /* no more buffered fragments */
+    if (rc != CURLE_OK) {
+      log_err("curl_ws_recv: %s", curl_easy_strerror(rc));
+      return;
+    }
+    if (n == 0) return;
+    if (meta && (meta->flags & CURLWS_PING)) {
+      /* answer pong on the fly, relay nothing */
+      size_t sent = 0;
+      curl_ws_send(g_curl, buf, n, &sent, 0, CURLWS_PONG);
+      continue;
+    }
+    buf_append(&g_wsbuf, buf, n);
+    /* message incomplete as long as the frame has remaining bytes —
+     * CURLWS_CONT is not enough: the FIRST fragment of a frame is not
+     * CONT. Loop on curl_ws_recv to drain ALL fragments that may be
+     * buffered internally by libcurl; return only on CURLE_AGAIN. */
+    if (meta && meta->bytesleft > 0) continue;
+    relay_message(g_wsbuf.data, g_wsbuf.len);
+    buf_reset(&g_wsbuf);
   }
-  if (n == 0) return;
-
-  if (meta && (meta->flags & CURLWS_PING)) {
-    /* answer pong on the fly, relay nothing */
-    size_t sent = 0;
-    curl_ws_send(g_curl, buf, n, &sent, 0, CURLWS_PONG);
-    return;
-  }
-
-  buf_append(&g_wsbuf, buf, n);
-  /* TRACE TEMPORAIRE 2026-08-12 (diagnostic fragmentation) — retirée
-   * après stabilisation. */
-  log_msg("TRC ws frame: n=%zu bytesleft=%d cont=%d bin=%d total=%zu",
-          n, meta ? (int)meta->bytesleft : -1,
-          meta ? !!(meta->flags & CURLWS_CONT) : -1,
-          meta ? !!(meta->flags & CURLWS_BINARY) : -1, g_wsbuf.len);
-  /* message incomplete as long as the frame has remaining bytes —
-   * CURLWS_CONT is not enough: the FIRST fragment of a frame is not
-   * CONT (bug of the serial recreations, fixed) */
-  if (meta && meta->bytesleft > 0) return;
-
-  relay_message(g_wsbuf.data, g_wsbuf.len);
-  buf_reset(&g_wsbuf);
 }
 
 /* --------------------------------------------------- clean exit */
