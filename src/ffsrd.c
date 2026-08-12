@@ -703,25 +703,9 @@ static int dedicated_window_create(void) {
   }
   g_nbtabs = MAX_TABS;
 
-  /* MARQUEUR D'IDENTITÉ (décision 2026-08-12) : la fenêtre dédiée est
-   * reconnaissable par le titre fixe "FFSR" sur son onglet 0 — le CLI
-   * la cible par ce marqueur, JAMAIS par active=true (la fenêtre active
-   * peut être une fenêtre personnelle). */
-  {
-    char params[192];
-    snprintf(params, sizeof(params),
-             "{\"expression\":\"document.title='FFSR'\","
-             "\"target\":{\"context\":\"%s\"},"
-             "\"awaitPromise\":false,\"resultOwnership\":\"none\"}",
-             g_tabs[0]);
-    char *mrep = bidi_call("script.evaluate", params);
-    if (!mrep) {
-      log_err("pose marqueur FFSR: pas de réponse");
-    } else {
-      free(mrep);
-      log_msg("marqueur FFSR posé sur l'onglet 0");
-    }
-  }
+  /* (le marqueur FFSR par document.title a été retiré — décision
+   * 2026-08-12 : tentative échouée devenue inutile depuis que window.sock
+   * sert le hash de mémoire ; les onglets 0-9 sont tous au travail) */
 
   /* VÉRIFICATION DE VISIBILITÉ : la fenêtre dédiée doit être visible et
    * active — browser.getClientWindows (jamais un ID mémorisé : Firefox
@@ -809,23 +793,14 @@ static int dedicated_window_ensure(void) {
   if (ok) {
     log_msg("fenêtre dédiée présente (matrice %d/10 saine, window=%s)",
             g_nbtabs, g_win_hint);
-    /* re-pose le marqueur (idempotent) : l'onglet 0 a pu être navigué */
-    char params[192];
-    snprintf(params, sizeof(params),
-             "{\"expression\":\"document.title='FFSR'\","
-             "\"target\":{\"context\":\"%s\"},"
-             "\"awaitPromise\":false,\"resultOwnership\":\"none\"}",
-             g_tabs[0]);
-    char *mrep = bidi_call("script.evaluate", params);
-    if (!mrep) log_err("re-pose marqueur FFSR: pas de réponse");
-    else free(mrep);
     return 0;
   }
 
   /* NIVEAU 2 — décision 2026-08-12 : le daemon ne ferme JAMAIS les
    * fenêtres ; quand la matrice du state est introuvable, il REPREND
-   * une fenêtre dédiée existante (marquée FFSR) au lieu d'en créer une
-   * nouvelle → pas de cascade de fenêtres à chaque redémarrage. */
+   * une fenêtre dédiée existante (SIGNATURE STRUCTURELLE : exactement
+   * MAX_TABS onglets — le marqueur par titre a été retiré) au lieu
+   * d'en créer une nouvelle → pas de cascade de fenêtres. */
   {
     /* re-getTree pour repartir sur des données fraîches */
     char *rep = bidi_call("browsingContext.getTree", "{\"maxDepth\":0}");
@@ -852,29 +827,21 @@ static int dedicated_window_ensure(void) {
           }
           n2++;
         }
-        /* pour chaque clientWindow distinct : le 1er onglet est-il
-         * marqué FFSR ? si oui, la fenêtre est dédiée → reprendre */
+        /* pour chaque clientWindow distinct : EXACTEMENT MAX_TABS
+         * onglets ? → c'est la fenêtre dédiée → reprendre */
         for (int i = 0; i < n2; i++) {
           if (!w2[i][0]) continue;
           int dejavu = 0;
           for (int j = 0; j < i; j++)
             if (w2[j][0] && strcmp(w2[j], w2[i]) == 0) dejavu = 1;
           if (dejavu) continue;
-          /* tester le marqueur sur ce 1er onglet */
-          char params[512];
-          snprintf(params, sizeof(params),
-                   "{\"expression\":\"document.title\","
-                   "\"target\":{\"context\":\"%s\"},"
-                   "\"awaitPromise\":false,\"resultOwnership\":\"none\"}",
-                   c2[i]);
-          char *mrep = bidi_call("script.evaluate", params);
-          if (!mrep) continue;
-          int marked = strstr(mrep, "\"FFSR\"") != NULL;
-          free(mrep);
-          if (!marked) continue;
+          int nb = 0;
+          for (int k = 0; k < n2; k++)
+            if (w2[k][0] && strcmp(w2[k], w2[i]) == 0) nb++;
+          if (nb != MAX_TABS) continue;
           /* fenêtre dédiée trouvée : l'adopter (state mis à jour) */
           g_nbtabs = 0;
-          snprintf(g_win_hint, sizeof(g_win_hint), "%s", w2[i]);
+          snprintf(g_win_hint, sizeof(g_win_hint), "%.63s", w2[i]);
           for (int k = 0; k < n2 && g_nbtabs < MAX_TABS; k++) {
             if (w2[k][0] && strcmp(w2[k], w2[i]) == 0) {
               size_t cl = strlen(c2[k]);

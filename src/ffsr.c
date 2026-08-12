@@ -68,9 +68,8 @@ static int read_until_eof(int fd, Buf *out, int timeout_s) {
   }
 }
 
-/* Un appel tunnel complet : connecte, envoie la trame, lit jusqu'à EOF.
- * Réponse dans *out (0 ou -1). */
-static int cli_call(const char *trame, Buf *out) {
+/* Un appel tunnel complet : connecte, envoie la trame, lit jusqu'à EOF. */
+static int cli_call_t(const char *trame, Buf *out, int timeout_s) {
   int fd = tunnel_connect();
   if (fd < 0) {
     log_err("ffsrd injoignable (%s) — est-il actif ? (ffsr d status)",
@@ -83,14 +82,18 @@ static int cli_call(const char *trame, Buf *out) {
     return EXIT_ERR;
   }
   buf_init(out);
-  if (read_until_eof(fd, out, 10) != 0) {
-    log_err("ffsrd muet (timeout 10 s) — réponse incomplète ?");
+  if (read_until_eof(fd, out, timeout_s) != 0) {
+    log_err("ffsrd muet (timeout %d s) — réponse incomplète ?", timeout_s);
     close(fd);
     buf_free(out);
     return EXIT_ERR;
   }
   close(fd);
   return EXIT_OK;
+}
+
+static int cli_call(const char *trame, Buf *out) {
+  return cli_call_t(trame, out, 10);
 }
 
 /* Envoie la trame et imprime la réponse sur stdout telle quelle. */
@@ -159,20 +162,18 @@ static int get_script_value(const char *doc, size_t len,
   return 0;
 }
 
-/* ffsr tabs — LA fenêtre dédiée uniquement, 10 lignes dans l'ordre,
- * format spec : N - URL - title - Ko.
- * IDENTIFICATION : le hash de la fenêtre dédiée vient de window.sock
- * (ffsrd le résout — le CLI ne devine JAMAIS la fenêtre). */
-static int cmd_tabs(void) {
-  char cw[64];
-  if (window_hash(cw, sizeof(cw)) != 0) return EXIT_ERR;
+/* LE SOCLE partagé (tabs, go, et les futures commandes) : le hash de la
+ * fenêtre dédiée via window.sock, puis getTree filtré sur ce hash →
+ * la liste ORDONNÉE des onglets de la dédiée (contextIds + urls, dans
+ * l'ordre du getTree). Retourne le nombre d'onglets (0 = dédiée
+ * introuvable). cw = hash lu, pour logs éventuels. */
+static int resolve_dedicated(char cw[64], char ctxs[64][64],
+                             char urls[64][2048]) {
+  if (window_hash(cw, 64) != 0) return 0;
 
-  /* 1. getTree : tous les contextes de premier niveau */
   Buf out;
   if (cli_call("{\"id\":2,\"method\":\"browsingContext.getTree\","
-               "\"params\":{\"maxDepth\":0}}", &out) != EXIT_OK) return EXIT_ERR;
-  char ctxs[64][64];
-  char urls[64][2048];
+               "\"params\":{\"maxDepth\":0}}", &out) != EXIT_OK) return 0;
   char cws[64][64];
   int n = 0;
   {
@@ -181,7 +182,7 @@ static int cmd_tabs(void) {
         || json_value_bounds(out.data + rs, re - rs, "contexts", &cs, &ce) != 1) {
       log_err("getTree: réponse inattendue");
       buf_free(&out);
-      return EXIT_ERR;
+      return 0;
     }
     const char *arr = out.data + rs + cs;
     size_t pos = 1, s = 0, e = 0;
@@ -211,10 +212,34 @@ static int cmd_tabs(void) {
   }
   buf_free(&out);
 
-  /* 2. les onglets de la fenêtre dédiée, dans l'ordre du getTree */
+  /* les onglets de la dédiée, dans l'ordre du getTree (séquence) */
   int idx = 0;
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n && idx < 64; i++) {
     if (!cws[i][0] || strcmp(cws[i], cw) != 0) continue;
+    if (idx != i) {  /* compacte vers le début */
+      memcpy(ctxs[idx], ctxs[i], sizeof(ctxs[idx]));
+      memcpy(urls[idx], urls[i], sizeof(urls[idx]));
+    }
+    idx++;
+  }
+  return idx;
+}
+
+/* ffsr tabs — LA fenêtre dédiée uniquement, 10 lignes dans l'ordre,
+ * format spec : N - URL - title - Ko. */
+static int cmd_tabs(void) {
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    printf("(aucun onglet dans la fenêtre dédiée)\n");
+    return EXIT_ERR;
+  }
+
+  Buf out;
+  int idx = 0;
+  for (int i = 0; i < count; i++) {
     char title[512] = "";
     double ko = 0.0;
     char trame[512];
@@ -222,7 +247,7 @@ static int cmd_tabs(void) {
              "{\"id\":3,\"method\":\"script.evaluate\",\"params\":{"
              "\"expression\":\"JSON.stringify({t:document.title,"
              "l:document.documentElement.outerHTML.length})\","
-             "\"target\":{\"context\":\"%s\"},"
+             "\"target\":{\"context\":\"%.63s\"},"
              "\"awaitPromise\":false,\"resultOwnership\":\"none\"}}",
              ctxs[i]);
     if (cli_call(trame, &out) == EXIT_OK) {
@@ -250,14 +275,68 @@ static int cmd_tabs(void) {
     printf("%d - %s - %s - %.2f Ko\n", idx, urls[i], title, ko);
     idx++;
   }
-  if (idx == 0) printf("(aucun onglet dans la fenêtre dédiée)\n");
   return EXIT_OK;
+}
+
+/* ffsr go <N> <url> [w] — navigue l'onglet N de la fenêtre dédiée.
+ * Sans 'w' : wait:none (réponse immédiate, prompt rendu tout de suite).
+ * Avec 'w'  : wait:interactive — la commande ne rend le prompt qu'une
+ * fois le DOM prêt (elle "accroche" le shell le temps du chargement).
+ * AUCUNE sortie au succès : le prompt qui revient EST la confirmation
+ * (décision 2026-08-12) ; erreurs sur stderr seulement. */
+static int cmd_go(int n, const char *url, int want_wait) {
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    log_err("fenêtre dédiée introuvable — aucun onglet ?");
+    return EXIT_ERR;
+  }
+  if (n >= count) {
+    log_err("onglet %d hors limites : la fenêtre dédiée a %d onglet(s)",
+            n, count);
+    return EXIT_BADARGS;
+  }
+
+  /* URL échappée pour le JSON */
+  char eurl[4096];
+  size_t o = 0;
+  for (const char *p = url; *p && o + 6 < sizeof(eurl); p++) {
+    switch (*p) {
+      case '"':  eurl[o++] = '\\'; eurl[o++] = '"';  break;
+      case '\\': eurl[o++] = '\\'; eurl[o++] = '\\'; break;
+      case '\n': eurl[o++] = '\\'; eurl[o++] = 'n';  break;
+      case '\r': eurl[o++] = '\\'; eurl[o++] = 'r';  break;
+      default:   eurl[o++] = *p;                     break;
+    }
+  }
+  eurl[o] = '\0';
+
+  char trame[5200];
+  snprintf(trame, sizeof(trame),
+           "{\"id\":3,\"method\":\"browsingContext.navigate\",\"params\":{"
+           "\"context\":\"%s\",\"url\":\"%s\",\"wait\":\"%s\"}}",
+           ctxs[n], eurl, want_wait ? "interactive" : "none");
+
+  Buf out;
+  if (cli_call_t(trame, &out, want_wait ? 60 : 10) != EXIT_OK) {
+    buf_free(&out);
+    return EXIT_ERR;
+  }
+  /* erreur BiDi (site down, URL invalide…) → stderr, sinon SILENCE */
+  int err = strstr(out.data, "\"type\":\"error\"") != NULL;
+  if (err) log_err("navigate: %.*s", (int)(out.len < 400 ? out.len : 400),
+                   out.data);
+  buf_free(&out);
+  return err ? EXIT_ERR : EXIT_OK;
 }
 
 static int show_usage(void) {
   printf("ffsr — FireFox Simple Relay (CLI)\n"
          "usage:\n"
-         "  ffsr tabs                  | liste les onglets de Firefox\n"
+         "  ffsr tabs                  | liste les 10 onglets de la fenêtre dédiée\n"
+         "  ffsr go <N 0-9> <url> [w]  | navigue l'onglet N ('w' = attend le chargement)\n"
          "  ffsr <trame-json-bidi>     | envoie la trame BiDi via le tunnel\n"
          "  ffsr d status              | état du service (systemctl)\n"
          "  ffsr d start               | systemctl start ffsrd.service\n"
@@ -297,6 +376,28 @@ int main(int argc, char **argv) {
 
   /* ffsr tabs — la liste des onglets */
   if (strcmp(argv[1], "tabs") == 0) return cmd_tabs();
+
+  /* ffsr go <N> <url> [w] — navigue l'onglet N de la fenêtre dédiée.
+   * 'w' = wait:interactive (la commande rend le prompt quand le DOM
+   * est prêt) ; sans 'w' = wait:none (réponse immédiate). */
+  if (strcmp(argv[1], "go") == 0) {
+    if (argc < 4 || argc > 5) {
+      log_err("usage : ffsr go <N 0-9> <url> [w]");
+      return EXIT_BADARGS;
+    }
+    char *end = NULL;
+    long n = strtol(argv[2], &end, 10);
+    if (!end || *end != '\0' || n < 0 || n > 9) {
+      log_err("N doit être un entier entre 0 et 9");
+      return EXIT_BADARGS;
+    }
+    int want_wait = (argc == 5 && strcmp(argv[4], "w") == 0);
+    if (argc == 5 && !want_wait) {
+      log_err("4e argument inconnu '%s' (attendu : w)", argv[4]);
+      return EXIT_BADARGS;
+    }
+    return cmd_go((int)n, argv[3], want_wait);
+  }
 
   /* Sinon : la trame BiDi est soit donnée telle quelle (JSON entre
    * quotes), soit assemblée par les futures commandes (go/tabs/...).
