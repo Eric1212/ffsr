@@ -26,12 +26,12 @@
 #define SOCK_PATH       "/run/ffsrd/ffsr.sock"
 #define WINDOW_SOCK     "/run/ffsrd/window.sock"
 
-/* get-file channel (2026-08-12) : le daemon dirige les téléchargements
- * de Firefox vers ce dossier ; le CLI y lit les fichiers, les sert sur
- * stdout, puis les purge. */
+/* get-file channel (2026-08-12): the daemon directs the downloads */
+ * from Firefox to this directory; the CLI reads the files, serves them on
+ * then purges them. */
 #define STAGING_DIR     "/tmp/ffsr"
-#define FALLBACK_TO     60   /* patience max du poll du staging, secondes */
-#define SERIALIZE_TO    10   /* timeout de la tentative directe sérialisée */
+#define FALLBACK_TO     60   /* max patience for staging poll (seconds) */
+#define SERIALIZE_TO    10   /* Direct serialization attempt timeout */
 
 /* ---------------------------------------------- socket to the tunnel */
 
@@ -504,10 +504,10 @@ static int cmd_f5(int n, int want_wait) {
   return err ? EXIT_ERR : EXIT_OK;
 }
 
-/* Collecte les contextIds des iframes DIRECTES de l'onglet `top` :
- * la réponse getTree imbrique les enfants dans le champ "children" de
- * l'objet parent (il n'existe PAS de champ "parent" côté enfant —
- * constat 2026-08-12). Retourne le nombre trouvé. */
+/* Collects the direct iframe contextIds of the `top` tab: the getTree response nests children in the parent object's "children" field (there is no "parent" child field — observation 2026-08-12). Returns the count found. */
+ * the getTree response nests the children in the "children" field of
+ * the parent object (there is no "parent" child field —
+ * observation 2026-08-12). Returns the count found. */
 static int collect_children(const char *doc, size_t len, const char *top,
                             char ids[][64], int max) {
   size_t rs = 0, re = 0, cs = 0, ce = 0;
@@ -521,7 +521,7 @@ static int collect_children(const char *doc, size_t len, const char *top,
       continue;
     size_t tl = ve - vs;
     if (tl != strlen(top) || memcmp(arr + s + vs, top, tl) != 0) continue;
-    /* l'onglet trouvé : liste ses enfants (le champ children, tableau) */
+    /* the found tab: list its children (the children array) */
     size_t chs = 0, che = 0;
     if (json_value_bounds(arr + s, e - s, "children", &chs, &che) != 1)
       return 0;
@@ -543,8 +543,8 @@ static int collect_children(const char *doc, size_t len, const char *top,
   return 0;
 }
 
-/* Le socle de l'extraction d'onglet : un script.evaluate sur le contexte,
- * la valeur (string JSON) est DÉSÉCHAPPÉE dans out → contenu réel brut. */
+/* The foundation of tab extraction: a script.evaluate on the context,
+ * the (JSON string) value unescaped in out → actual raw content. */
 static int evaluate_ctx_t(const char *ctx, const char *expression, Buf *out,
                           int timeout_s) {
   char trame[6000];
@@ -572,16 +572,16 @@ static int evaluate_ctx_t(const char *ctx, const char *expression, Buf *out,
 }
 
 static int evaluate_ctx(const char *ctx, const char *expression, Buf *out) {
-  /* 120 s : le pont peut marquer une pause de ~30 s en plein milieu
-   * d'une grosse sérialisation (constat 2026-08-12, google 3,2 Mo) */
+  /* 120 s : the bridge can mark a pause of ~30 s in the middle
+ * a large serialization (observation 2026-08-12, google 3.2 MB) */
   return evaluate_ctx_t(ctx, expression, out, 120);
 }
 
-/* ffsr get child <N> — le HTML des iframes de l'onglet : getTree
- * maxDepth:1 (les enfants directs seulement — l'arbre complet multi-Mo
- * dépasse la gestion de fragmentation du tunnel, constat 2026-08-12)
- * → les contextes dont le parent est l'onglet → leur outerHTML,
- * séparés par des lignes de contexte. Sortie brute (on itérera). */
+/* ffsr get child <N> — the HTML of the iframes of the tab : getTree...
+ * maxDepth:1 (the direct children only — the multi-Mo complete tree
+ * exceeds the tunnel fragmentation management, observation 2026-08-12)
+ * → the contexts whose parent is the tab → their outerHTML,
+ * separated by context lines. Raw output. */
 static int get_child(const char *top_ctx) {
   Buf out;
   if (cli_call("{\"id\":2,\"method\":\"browsingContext.getTree\","
@@ -609,10 +609,10 @@ static int get_child(const char *top_ctx) {
 
 /* ------------------------------------------------ get-file channel */
 
-/* Envoie une évaluation (trame BiDi complète) SANS écriture de la réponse
- * sur stdout. La réponse du pont peut mettre ~10 s à venir ; on attend
- * qu'elle arrive (cli_call) mais on la jette — le fichier du staging est
- * la seule preuve. (send_trame ne convient pas : il imprime la réponse.) */
+/* Sends a full BiDi evaluation frame WITHOUT writing the response to stdout
+ * the bridge's response may take ~10 s to arrive; we wait for it (cli_call) but then discard it — the staging file is the only proof
+ *
+ * (send_trame is not suitable: it prints the response.) */
 static int send_eval_no_wait(const char *ctx, const char *expr) {
   Buf j;
   buf_init(&j);
@@ -629,10 +629,10 @@ static int send_eval_no_wait(const char *ctx, const char *expr) {
   return rc == EXIT_OK ? 0 : -1;
 }
 
-/* Clic download d'un Blob du rendu (outerHTML) : Firefox écrit le
- * fichier binaire dans le staging, SANS sérialisation BiDi (le goulot).
- * On n'attend AUCUNE réponse : le fichier qui apparaît dans le staging
- * est la seule preuve. */
+/* Blob download of the rendered (outerHTML): Firefox writes the binary file to the staging,
+ * Binary file in the staging, WITHOUT BiDi serialization (the bottleneck).
+ * We await NO response: the file appearing in the staging is the only proof.
+ *  */
 static int blob_download(const char *ctx, int n) {
   char expr[2200];
   snprintf(expr, sizeof(expr),
@@ -644,8 +644,8 @@ static int blob_download(const char *ctx, int n) {
   return send_eval_no_wait(ctx, expr);
 }
 
-/* Clic download de la SOURCE (l'URL de l'onglet) — mp4, images, HTML brut.
- * Même principe : envoi sans attente de réponse. */
+/* Source (URL of the tab) download — mp4, images, raw HTML.
+ * Same principle: no response wait. */
 static int src_download(const char *ctx, int n, const char *url) {
   Buf jurl;
   buf_init(&jurl);
@@ -664,9 +664,9 @@ static int src_download(const char *ctx, int n, const char *url) {
   return send_eval_no_wait(ctx, expr);
 }
 
-/* Cherche un fichier du staging (nom exact, ou préfixe si src=1 car
- * l'extension MIME est choisie par Firefox). Si présent ET stable (2
- * stats identiques à 1 s : écriture terminée) : lit, purge, 0. */
+/* Looks for a staging file (exact name, or prefix if src=1 since MIME type is chosen by Firefox)
+ * the MIME type is chosen by Firefox). If present AND stable (2
+ * identical stats at 1 s: write complete) : lit, purge, 0. */
 static int read_staging(const char *name, int src, Buf *out) {
   DIR *dir = opendir(STAGING_DIR);
   if (!dir) return -1;
@@ -704,8 +704,8 @@ static int read_staging(const char *name, int src, Buf *out) {
   return 0;
 }
 
-/* Poll du staging : 1×/s, timeout global — le pont met 10-120 s à se
- * libérer d'une sérialisation abandonnée avant que le clic ne parte. */
+/* Staging poll: 1×/s, global timeout — the bridge takes 10-120 s to release
+ * free an abandoned serialization before the click leaves. */
 static int wait_staging(const char *name, int src, Buf *out) {
   for (int i = 0; i < FALLBACK_TO; i++) {
     if (read_staging(name, src, out) == 0) return 0;
@@ -714,9 +714,9 @@ static int wait_staging(const char *name, int src, Buf *out) {
   return -1;
 }
 
-/* ffsr get file <N> [w] [-src] : le canal binaire. Sans w : clic →
- * retour immédiat (le LLM rappelle la commande pour lire le fichier
- * une fois écrit). Avec w : clic + poll 1×/s → stdout. */
+/* ffsr get file <N> [w] [-src]: binary channel. Without w: click + immediate return,
+ * LLM polls to read the file once written
+ * With w: click + poll 1×/s → stdout. */
 static int cmd_get_file(int n, int want_wait, int src) {
   char cw[64];
   char ctxs[64][64];
@@ -737,7 +737,7 @@ static int cmd_get_file(int n, int want_wait, int src) {
   Buf out;
   buf_init(&out);
   if (read_staging(name, src, &out) == 0) {
-    /* binaire EXACT : pas de '\n' final (le sha doit correspondre) */
+    /* EXACT binary: no trailing \\n (sha must match) */
     if (out.len > 0) fwrite(out.data, 1, out.len, stdout);
     buf_free(&out);
     return EXIT_OK;
@@ -768,7 +768,7 @@ static int cmd_get_file(int n, int want_wait, int src) {
 
 /* ------------------------------------------------------- screen */
 
-/* Décode du base64 standard (A-Za-z0-9+/=) dans out. 0 ou -1. */
+/* Decodes standard base64 (A-Za-z0-9+/=) into out. 0 or -1. */
 static int base64_decode(const char *s, size_t n, Buf *out) {
   int val = 0, bits = 0;
   for (size_t i = 0; i < n; i++) {
@@ -792,11 +792,11 @@ static int base64_decode(const char *s, size_t n, Buf *out) {
   return 0;
 }
 
-/* ffsr screen <N> — capture WebP du viewport de l'onglet N, servie EXACT
- * sur stdout (aucun dossier : redirection shell, même philosophie que
- * get file). La capture exige une page VISIBLE — le pont attend
- * indéfiniment sinon (découvert 2026-08-12) : browsingContext.activate
- * d'abord, puis captureScreenshot (webp 0.8, réponse en ~0,1 s). */
+/* ffsr screen <N> — capture WebP of the tab N viewport, served EXACT
+ * on stdout (no directory: redirection shell, same philosophy as get file)
+ * get file). The capture requires a VISIBLE page — the bridge waits indefinitely
+ * indefinitely otherwise discovered 2026-08-12: browsingContext.activate
+ * first, then captureScreenshot (webp 0.8, response in ~0.1 s).*/
 static int cmd_screen(int n) {
   char cw[64];
   char ctxs[64][64];
@@ -876,9 +876,9 @@ static int cmd_screen(int n) {
 
 /* ------------------------------------------------------- get con */
 
-/* Mini-parseur JSON : sépare les trames du flux du stream (string-aware :
- * les accolades à l'intérieur des chaînes ne comptent pas). Imprime
- * chaque log.entryAdded sur stdout. Retourne à EOF (daemon fermé). */
+/* JSON mini-parser: separates frames from the stream (string-aware:
+ * braces inside strings do not count). Prints
+ * each log.entryAdded on stdout. Returns at EOF (daemon closed).*/
 static void stream_loop(int fd) {
   char tmp[16384];
   Buf acc;
@@ -914,11 +914,11 @@ static void stream_loop(int fd) {
   }
 }
 
-/* ffsr get con <N> — STREAM console (SEUL stream de v1) : s'abonne à
- * log.entryAdded sur le contexte de l'onglet N (session.subscribe, la
- * connexion reste ouverte côté daemon) et imprime chaque entrée au fil
- * de l'eau sur stdout. S'arrête au Ctrl+C (SIGINT tue le processus,
- * le daemon libère le slot). */
+/* ffsr get con <N> — Console stream (only stream in v1): subscribes to
+ * log.entryAdded on tab N's context (session.subscribe, the
+ * connection stays open on daemon side) and prints each entry as they come
+ * on stdout. Stops at Ctrl+C (SIGINT kills the process,
+ * daemon releases the slot).*/
 static int cmd_get_con(int n) {
   char cw[64];
   char ctxs[64][64];
@@ -954,11 +954,11 @@ static int cmd_get_con(int n) {
   return EXIT_OK;
 }
 
-/* ffsr get [html|txt|net|child|file|con] <N> [-src] [w]— LE socle groupé
- * des extractions (HTML, texte visible, instantané réseau = la même
- * mécanique, seule l'expression change ; child = boucle des iframes ;
- * file = canal binaire blob/source ; con = stream console). Sortie
- * BRUTE. */
+/* ffsr get [html|txt|net|child|file|con] <N> [-src] [w]— Grouped core of extractions
+ * extractions (HTML, visible text, network snapshot = same mechanism,
+ * only the expression changes; child = iframe loop;
+ * file = binary blob/source stream; con = console stream). RAW output,
+ BRUTE. */
 static int cmd_get(const char *type, int n, int want_wait) {
   char cw[64];
   char ctxs[64][64];
@@ -988,9 +988,9 @@ static int cmd_get(const char *type, int n, int want_wait) {
 
   Buf out;
   buf_init(&out);
-  /* La tentative directe : sérialisée par le pont. Timeout court — si le
-   * sérialiseur s'engorge (pages lourdes, pont occupé), le fallback blob
-   * prend le relais (même contenu : le rendu), par le disque, sans limite. */
+  /* Direct attempt: serialized by the bridge. Short timeout — if the
+   * serializer overflows (heavy pages, busy bridge), the fallback blob
+   * takes over (same content: the rendering), via disk with no limit. */
   if (evaluate_ctx_t(ctxs[n], expr, &out, SERIALIZE_TO) != 0) {
     buf_free(&out);
     if (strcmp(type, "html") != 0) {
@@ -1105,7 +1105,7 @@ int main(int argc, char **argv) {
     return EXIT_BADARGS;
   }
 
-  /* ffsr get [html|txt|net|child|file] <N> [w] [-src] — extraction onglet N */
+/* ffsr get [html|txt|net|child|file] <N> [w] [-src]— Grouped core of extractions (HTML, visible text, network snapshot = same mechanism, only the expression changes; child = iframe loop; file = binary blob/source stream; con = console stream). RAW output. */
   if (strcmp(argv[1], "get") == 0) {
     if (argc < 3 || argc > 6) {
       log_err("usage: ffsr get [html|txt|net|child|file] <N 0-9> [w] [-src]");

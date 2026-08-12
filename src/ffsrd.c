@@ -433,8 +433,8 @@ static int ws_connect_firefox(void) {
     return -1;
   }
 
-  /* get-file channel (2026-08-12) : Firefox écrit les blobs téléchargés
-   * ici — le CLI les lit, les sert sur stdout, puis les purge. */
+  /* get-file channel (2026-08-12) : Firefox writes the downloaded blobs
+   * here — the CLI reads them, serves them on stdout, then purges them. */
   if (mkdir("/tmp/ffsr", 0777) != 0 && errno != EEXIST) {
     log_msg("warning: cannot mkdir /tmp/ffsr (errno %d)", errno);
   }
@@ -960,7 +960,7 @@ int main(int argc, char **argv) {
     return EXIT_ERR;
   }
 
-  /* file log (built-in 1 Mo rotation): the system journal only filters
+  /* file log (built-in 1 MB rotation): the system journal only filters
    * the severe — the daemon log is our reliable source. */
   {
     char dir[256];
