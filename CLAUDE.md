@@ -25,9 +25,30 @@ vérifications), en contrôlant une fenêtre Firefox dédiée, visible et unique
 ## Stack
 
 - C11 + libcurl (8.21.0-2, headers multiarch présents), GCC 15.
-- Mono-fichier + Makefile. Sortie stdout machine-readable, stderr humain.
+- **Un fichier source par binaire (zéro partage — validé Éric 2026-08-11)** :
+  chaque binaire duplique ce dont il a besoin (JSON, helpers), jamais de
+  `common.*`. Autonomie > DRY.
+- Sortie stdout machine-readable, stderr humain.
 - Le pont : `ws://127.0.0.1:9222/session`, répond SANS Origin (validé).
   Les endpoints `/json/*` sont des reliquats CDP : leur 404 est NORMAL.
+
+## Structure du repo (validée 2026-08-11)
+
+```
+ffsr/
+├── CLAUDE.md               ← la spec
+├── Makefile                ← make (2 binaires) ; make install (binaires,
+│                               unit systemd, config, systemctl enable)
+├── src/
+│   ├── ffsrd.c             ← daemon COMPLET en un fichier : WS+session,
+│   │                           socket serveur, chown, state, hooks systemd
+│   └── ffsr.c              ← CLI COMPLET en un fichier : parsing, socket
+│                               client, toutes les commandes
+├── systemd/
+│   └── ffsrd.service       ← unit calquée sur ram-reclaim
+└── etc/
+    └── ffsrd.conf          ← config exemple (9222, FFSRD_TARGET_UID=1000)
+```
 
 ## Structure ffsr ⇄ Firefox (validée 2026-08-11, vivante)
 
