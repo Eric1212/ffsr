@@ -113,6 +113,13 @@ Firefox (9222) ◄──WS unique── ffsrd (passthrough pur, détient la sess
   réponse au bon fd via sa table `id_global → fd`. Sans réécriture, les
   ids 1,2,3… de deux clients se croiseraient sur le WS. C'est le SEUL
   champ qu'il parse — le reste de la trame passe tel quel (passthrough).
+- **L'id choisi par ffsr = sanity check (décision 2026-08-11)** : le CLI est
+  mono-demande (1 processus = 1 connexion = 1 trame = 1 réponse — la
+  simultanéité vient de la pluralité des processus, chacun dans son bash),
+  donc il n'a rien à corréler ; mais la réponse qui lui revient est le
+  **miroir exact** de sa demande (même id rendu par le daemon). Tout
+  client peut utiliser n'importe quelle valeur (1, 7, 42…), l'unicité
+  n'est requise QUE sur le WS (id global du daemon).
 - Ouvre `ws://127.0.0.1:9222/session` et crée la session UNE seule fois, au
   démarrage. Il vit en silence ensuite (persistance idle prouvée : aucun
   timeout serveur).

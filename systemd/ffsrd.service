@@ -1,7 +1,6 @@
 [Unit]
 Description=ffsrd — FireFox Simple Relay daemon (WS bridge to 9222)
 Documentation=man:ffsr(1)
-After=network.target
 
 [Service]
 Type=simple
@@ -12,6 +11,13 @@ RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 
+# Répertoires gérés par systemd (créés au start, purgés au stop)
+# RuntimeDirectoryMode=0755 : CRITIQUE — eric (le CLI, uid 1000) doit
+# pouvoir pénétrer /run/ffsrd pour atteindre le socket chowné.
+RuntimeDirectory=ffsrd
+RuntimeDirectoryMode=0755
+StateDirectory=ffsrd
+
 # Hardening (calqué sur ram-reclaim.service de la machine de référence)
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -19,7 +25,7 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ReadWritePaths=/run/ffsrd /var/lib/ffsrd
+ProtectControlGroups=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
