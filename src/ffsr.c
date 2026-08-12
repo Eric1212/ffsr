@@ -293,6 +293,59 @@ static int has_scheme(const char *url) {
   return 0;
 }
 
+/* percent-encode d'une requête (C++ → C%2B%2B, espaces → %20). */
+static void url_encode(const char *in, char *out, size_t sz) {
+  static const char *hex = "0123456789ABCDEF";
+  size_t o = 0;
+  for (const char *p = in; *p && o + 3 < sz; p++) {
+    unsigned char c = (unsigned char)*p;
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~') {
+      out[o++] = (char)c;
+    } else {
+      out[o++] = '%';
+      out[o++] = hex[c >> 4];
+      out[o++] = hex[c & 15];
+    }
+  }
+  out[o] = '\0';
+}
+
+/* Le cœur de toute navigation : échappe l'URL pour le JSON, envoie
+ * browseContext.navigate, silencieux au succès, erreurs sur stderr. */
+static int navigate_ctx(const char *ctx, const char *url, const char *wait,
+                        int timeout_s) {
+  char eurl[4096];
+  size_t o = 0;
+  for (const char *p = url; *p && o + 6 < sizeof(eurl); p++) {
+    switch (*p) {
+      case '"':  eurl[o++] = '\\'; eurl[o++] = '"';  break;
+      case '\\': eurl[o++] = '\\'; eurl[o++] = '\\'; break;
+      case '\n': eurl[o++] = '\\'; eurl[o++] = 'n';  break;
+      case '\r': eurl[o++] = '\\'; eurl[o++] = 'r';  break;
+      default:   eurl[o++] = *p;                     break;
+    }
+  }
+  eurl[o] = '\0';
+
+  char trame[5600];
+  snprintf(trame, sizeof(trame),
+           "{\"id\":3,\"method\":\"browsingContext.navigate\",\"params\":{"
+           "\"context\":\"%.63s\",\"url\":\"%s\",\"wait\":\"%s\"}}",
+           ctx, eurl, wait);
+
+  Buf out;
+  if (cli_call_t(trame, &out, timeout_s) != EXIT_OK) {
+    buf_free(&out);
+    return EXIT_ERR;
+  }
+  int err = strstr(out.data, "\"type\":\"error\"") != NULL;
+  if (err) log_err("navigate: %.*s", (int)(out.len < 400 ? out.len : 400),
+                   out.data);
+  buf_free(&out);
+  return err ? EXIT_ERR : EXIT_OK;
+}
+
 /* ffsr go <N> <url> [w] — navigue l'onglet N de la fenêtre dédiée.
  * Sans 'w' : wait:none (réponse immédiate, prompt rendu tout de suite).
  * Avec 'w'  : wait:interactive — la commande ne rend le prompt qu'une
@@ -323,34 +376,118 @@ static int cmd_go(int n, const char *url, int want_wait) {
     target = fixed;
   }
 
-  /* URL échappée pour le JSON */
-  char eurl[4096];
-  size_t o = 0;
-  for (const char *p = target; *p && o + 6 < sizeof(eurl); p++) {
-    switch (*p) {
-      case '"':  eurl[o++] = '\\'; eurl[o++] = '"';  break;
-      case '\\': eurl[o++] = '\\'; eurl[o++] = '\\'; break;
-      case '\n': eurl[o++] = '\\'; eurl[o++] = 'n';  break;
-      case '\r': eurl[o++] = '\\'; eurl[o++] = 'r';  break;
-      default:   eurl[o++] = *p;                     break;
-    }
-  }
-  eurl[o] = '\0';
+  return navigate_ctx(ctxs[n], target, want_wait ? "interactive" : "none",
+                      want_wait ? 60 : 10);
+}
 
-  char trame[5200];
+/* ffsr search — PUR liste des moteurs acceptés, par ordre de préférence.
+ * Aucune navigation (spec CLAUDE.md) ; l'IA compose les URLs avec go. */
+static int cmd_search_list(void) {
+  printf("google https://www.google.com/search?q=\n");
+  printf("paulgo https://paulgo.io/search?q=\n");
+  printf("startpage https://www.startpage.com/sp/search?query=\n");
+  printf("duckduckgo https://html.duckduckgo.com/html/?q=\n");
+  return EXIT_OK;
+}
+
+/* ffsr search go <onglets> <requête> — recherche EN PARALLÈLE (rafale de
+ * navigations wait:none), un moteur par onglet, mapping positionnel :
+ * position 1=google, 2=paulgo, 3=startpage, 4=duckduckgo. Onglets
+ * séparés par virgules ; position VIDE (double virgule) = moteur sauté.
+ * La requête est TOUJOURS le dernier argument. Silencieux au succès. */
+static int cmd_search_go(const char *tabs_list, const char *query) {
+  static const char *bases[4] = {
+    "https://www.google.com/search?q=",
+    "https://paulgo.io/search?q=",
+    "https://www.startpage.com/sp/search?query=",
+    "https://html.duckduckgo.com/html/?q="
+  };
+  char enc[4096];
+  url_encode(query, enc, sizeof(enc));
+
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    log_err("fenêtre dédiée introuvable — aucun onglet ?");
+    return EXIT_ERR;
+  }
+
+  int pos = 0, err = 0;
+  const char *p = tabs_list;
+  while (*p && pos < 4) {
+    const char *comma = strchr(p, ',');
+    int len = comma ? (int)(comma - p) : (int)strlen(p);
+    if (len == 0) {            /* position vide : moteur sauté */
+      pos++;
+      p = comma ? comma + 1 : p + 1;
+      continue;
+    }
+    char buf[8];
+    if (len > 7) len = 7;
+    memcpy(buf, p, (size_t)len);
+    buf[len] = '\0';
+    char *end = NULL;
+    long n = strtol(buf, &end, 10);
+    if (!end || *end != '\0' || n < 0 || n > 9) {
+      log_err("onglet invalide '%s' (attendu 0-9)", buf);
+      return EXIT_BADARGS;
+    }
+    if (n >= count) {
+      log_err("onglet %ld hors limites : la fenêtre dédiée a %d onglet(s)",
+              n, count);
+      return EXIT_BADARGS;
+    }
+    char full[4600];
+    snprintf(full, sizeof(full), "%s%s", bases[pos], enc);
+    if (navigate_ctx(ctxs[n], full, "none", 10) != EXIT_OK) err = 1;
+    pos++;
+    p = comma ? comma + 1 : p + len;
+  }
+  if (pos == 0) {
+    log_err("aucun onglet donné");
+    return EXIT_BADARGS;
+  }
+  if (*p) {
+    log_err("trop de positions : 4 moteurs maximum");
+    return EXIT_BADARGS;
+  }
+  return err ? EXIT_ERR : EXIT_OK;
+}
+
+/* ffsr f5 <N> [w] — HARD reload TOUJOURS (cac:bypass, équivalent
+ * Ctrl+Shift+R, jamais de cache préservé — spec CLAUDE.md). Le 'w'
+ * module le wait : sans 'w' → réponse immédiate ; avec 'w' → attend le
+ * chargement complet. Silencieux au succès. */
+static int cmd_f5(int n, int want_wait) {
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    log_err("fenêtre dédiée introuvable — aucun onglet ?");
+    return EXIT_ERR;
+  }
+  if (n >= count) {
+    log_err("onglet %d hors limites : la fenêtre dédiée a %d onglet(s)",
+            n, count);
+    return EXIT_BADARGS;
+  }
+
+  char trame[512];
   snprintf(trame, sizeof(trame),
-           "{\"id\":3,\"method\":\"browsingContext.navigate\",\"params\":{"
-           "\"context\":\"%s\",\"url\":\"%s\",\"wait\":\"%s\"}}",
-           ctxs[n], eurl, want_wait ? "interactive" : "none");
+           "{\"id\":3,\"method\":\"browsingContext.reload\",\"params\":{"
+           "\"context\":\"%.63s\",\"cache\":\"bypass\",\"wait\":\"%s\"}}",
+           ctxs[n], want_wait ? "complete" : "none");
 
   Buf out;
   if (cli_call_t(trame, &out, want_wait ? 60 : 10) != EXIT_OK) {
     buf_free(&out);
     return EXIT_ERR;
   }
-  /* erreur BiDi (site down, URL invalide…) → stderr, sinon SILENCE */
   int err = strstr(out.data, "\"type\":\"error\"") != NULL;
-  if (err) log_err("navigate: %.*s", (int)(out.len < 400 ? out.len : 400),
+  if (err) log_err("reload: %.*s", (int)(out.len < 400 ? out.len : 400),
                    out.data);
   buf_free(&out);
   return err ? EXIT_ERR : EXIT_OK;
@@ -361,6 +498,9 @@ static int show_usage(void) {
          "usage:\n"
          "  ffsr tabs                  | liste les 10 onglets de la fenêtre dédiée\n"
          "  ffsr go <N 0-9> <url> [w]  | navigue l'onglet N ('w' = attend le chargement)\n"
+         "  ffsr search                | liste les moteurs de recherche acceptés\n"
+         "  ffsr search go <onglets,> <requête> | recherche parallèle (position=1 google, 2 paulgo, 3 startpage, 4 ddg ; position vide = saut)\n"
+         "  ffsr f5 <N 0-9> [w]        | hard reload de l'onglet N (cache bypass)\n"
          "  ffsr <trame-json-bidi>     | envoie la trame BiDi via le tunnel\n"
          "  ffsr d status              | état du service (systemctl)\n"
          "  ffsr d start               | systemctl start ffsrd.service\n"
@@ -421,6 +561,35 @@ int main(int argc, char **argv) {
       return EXIT_BADARGS;
     }
     return cmd_go((int)n, argv[3], want_wait);
+  }
+
+  /* ffsr search | ffsr search go <onglets> <requête> */
+  if (strcmp(argv[1], "search") == 0) {
+    if (argc == 2) return cmd_search_list();
+    if (argc == 5 && strcmp(argv[2], "go") == 0)
+      return cmd_search_go(argv[3], argv[4]);
+    log_err("usage : ffsr search | ffsr search go <onglets 0-9,0-9> <requête>");
+    return EXIT_BADARGS;
+  }
+
+  /* ffsr f5 <N> [w] — hard reload (cache bypass) de l'onglet N */
+  if (strcmp(argv[1], "f5") == 0) {
+    if (argc < 3 || argc > 4) {
+      log_err("usage : ffsr f5 <N 0-9> [w]");
+      return EXIT_BADARGS;
+    }
+    char *end = NULL;
+    long n = strtol(argv[2], &end, 10);
+    if (!end || *end != '\0' || n < 0 || n > 9) {
+      log_err("N doit être un entier entre 0 et 9");
+      return EXIT_BADARGS;
+    }
+    int want_wait = (argc == 4 && strcmp(argv[3], "w") == 0);
+    if (argc == 4 && !want_wait) {
+      log_err("3e argument inconnu '%s' (attendu : w)", argv[3]);
+      return EXIT_BADARGS;
+    }
+    return cmd_f5((int)n, want_wait);
   }
 
   /* Sinon : la trame BiDi est soit donnée telle quelle (JSON entre
