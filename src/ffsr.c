@@ -26,7 +26,7 @@
 #define SOCK_PATH       "/run/ffsrd/ffsr.sock"
 #define WINDOW_SOCK     "/run/ffsrd/window.sock"
 
-/* get-file channel (2026-08-12): the daemon directs the downloads */
+/* get-file channel (2026-08-12): the daemon directs the downloads
  * from Firefox to this directory; the CLI reads the files, serves them on
  * then purges them. */
 #define STAGING_DIR     "/tmp/ffsr"
@@ -504,7 +504,7 @@ static int cmd_f5(int n, int want_wait) {
   return err ? EXIT_ERR : EXIT_OK;
 }
 
-/* Collects the direct iframe contextIds of the `top` tab: the getTree response nests children in the parent object's "children" field (there is no "parent" child field — observation 2026-08-12). Returns the count found. */
+/* Collects the direct iframe contextIds of the `top` tab: the getTree response nests children in the parent object's "children" field (there is no "parent" child field — observation 2026-08-12). Returns the count found.
  * the getTree response nests the children in the "children" field of
  * the parent object (there is no "parent" child field —
  * observation 2026-08-12). Returns the count found. */
