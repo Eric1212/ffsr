@@ -25,9 +25,6 @@ vérifications), en contrôlant une fenêtre Firefox dédiée, visible et unique
 ## Stack
 
 - C11 + libcurl (8.21.0-2, headers multiarch présents), GCC 15.
-- **Un fichier source par binaire (zéro partage — validé Éric 2026-08-11)** :
-  chaque binaire duplique ce dont il a besoin (JSON, helpers), jamais de
-  `common.*`. Autonomie > DRY.
 - Sortie stdout machine-readable, stderr humain.
 - Le pont : `ws://127.0.0.1:9222/session`, répond SANS Origin (validé).
   Les endpoints `/json/*` sont des reliquats CDP : leur 404 est NORMAL.
@@ -37,17 +34,22 @@ vérifications), en contrôlant une fenêtre Firefox dédiée, visible et unique
 ```
 ffsr/
 ├── CLAUDE.md               ← la spec
-├── Makefile                ← make (2 binaires) ; make install (binaires,
-│                               unit systemd, config, systemctl enable)
+├── Makefile                ← build + install (binaires, unit, config, enable)
+│
 ├── src/
-│   ├── ffsrd.c             ← daemon COMPLET en un fichier : WS+session,
-│   │                           socket serveur, chown, state, hooks systemd
-│   └── ffsr.c              ← CLI COMPLET en un fichier : parsing, socket
-│                               client, toutes les commandes
+│   ├── common.h/.c         ← partagé : buffer/strings, erreurs+exit, JSON
+│   │                           minimal, log (les DEUX binaires l'utilisent)
+│   ├── ffsrd.c             ← le daemon en UN fichier : WS+session, socket
+│   │                           serveur, chown, state, systemd hooks
+│   └── ffsr.c              ← le CLI en UN fichier : parsing, socket client,
+│                               toutes les commandes (go/tabs/search/...)
+│
 ├── systemd/
-│   └── ffsrd.service       ← unit calquée sur ram-reclaim
+│   └── ffsrd.service       ← unit calquée sur ram-reclaim (restart, hardening)
+│
 └── etc/
-    └── ffsrd.conf          ← config exemple (9222, FFSRD_TARGET_UID=1000)
+    └── ffsrd.conf          ← config exemple (port 9222, FFSRD_TARGET_UID=1000)
+                                 → copiée vers /etc/ffsrd/ par make install
 ```
 
 ## Structure ffsr ⇄ Firefox (validée 2026-08-11, vivante)
