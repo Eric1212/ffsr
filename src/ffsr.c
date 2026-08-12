@@ -1044,6 +1044,26 @@ static int show_usage(void) {
 
 int main(int argc, char **argv) {
   if (argc < 2) return show_usage();
+  /* Special help flags: h, -h, help, -help, --help → show usage */
+  if (argc == 2 &&
+      (strcmp(argv[1], "h") == 0 ||
+       strcmp(argv[1], "-h") == 0 ||
+       strcmp(argv[1], "help") == 0 ||
+       strcmp(argv[1], "-help") == 0 ||
+       strcmp(argv[1], "--help") == 0)) {
+    return show_usage();
+  }
+  /* Unknown command → show usage */
+  if (argc == 2 &&
+      strcmp(argv[1], "d") != 0 &&
+      strcmp(argv[1], "tabs") != 0 &&
+      strcmp(argv[1], "go") != 0 &&
+      strcmp(argv[1], "search") != 0 &&
+      strcmp(argv[1], "get") != 0 &&
+      strcmp(argv[1], "screen") != 0 &&
+      strcmp(argv[1], "f5") != 0) {
+    return show_usage();
+  }
 
   /* ffsr d … → systemctl (the only commands touching ffsrd) */
   if (strcmp(argv[1], "d") == 0) {
