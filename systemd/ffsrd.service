@@ -20,9 +20,7 @@ StateDirectory=ffsrd
 
 # Hardening
 NoNewPrivileges=yes
-ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

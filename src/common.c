@@ -9,9 +9,11 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <errno.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------- buffers */
@@ -461,6 +463,7 @@ int json_array_next(const char *arr, size_t len, size_t *pos,
 
 /* ------------------------------------------------------------ utils */
 
+/* strdup-like without POSIX: returns a copied malloc or NULL. */
 char *xstrdup(const char *s) {
   size_t n = strlen(s) + 1;
   char *p = malloc(n);
@@ -471,4 +474,31 @@ char *xstrdup(const char *s) {
 bool file_exists(const char *path) {
   struct stat st;
   return stat(path, &st) == 0;
+}
+
+void set_sock_buffers(int fd) {
+  /* Heavy payloads must pass through (outerHTML of big pages, giant
+   * getTree…): ask the kernel for the max socket buffers (4 Mo here,
+   * clamped to SO_RCVBUF/SO_SNDBUF max). Without this, the default
+   * ~208 Ko truncates multi-Mo responses (decision 2026-08-12). */
+  int v = 4 * 1024 * 1024;
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v));
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v));
+}
+
+/* write everything, retrying on partial writes: a single write() can
+ * return before the whole payload when the peer reads slowly — the
+ * caller must never accept truncated responses. Returns 0 or -1. */
+int write_all(int fd, const char *data, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t w = write(fd, data + off, len - off);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (w == 0) return -1;
+    off += (size_t)w;
+  }
+  return 0;
 }

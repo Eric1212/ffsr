@@ -20,9 +20,18 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
 #define SOCK_PATH       "/run/ffsrd/ffsr.sock"
 #define WINDOW_SOCK     "/run/ffsrd/window.sock"
+
+/* get-file channel (2026-08-12) : le daemon dirige les téléchargements
+ * de Firefox vers ce dossier ; le CLI y lit les fichiers, les sert sur
+ * stdout, puis les purge. */
+#define STAGING_DIR     "/tmp/ffsr"
+#define FALLBACK_TO     60   /* patience max du poll du staging, secondes */
+#define SERIALIZE_TO    10   /* timeout de la tentative directe sérialisée */
 
 /* ---------------------------------------------- socket to the tunnel */
 
@@ -41,6 +50,7 @@ static int tunnel_connect(void) {
     errno = e;
     return -1;
   }
+  set_sock_buffers(fd);   /* heavy responses must pass through */
   return fd;
 }
 
@@ -77,7 +87,7 @@ static int cli_call_t(const char *trame, Buf *out, int timeout_s) {
             strerror(errno));
     return EXIT_ERR;
   }
-  if (write(fd, trame, strlen(trame)) != (ssize_t)strlen(trame)) {
+  if (write_all(fd, trame, strlen(trame)) != 0) {
     log_err("tunnel write: %s", strerror(errno));
     close(fd);
     return EXIT_ERR;
@@ -336,6 +346,7 @@ static int navigate_ctx(const char *ctx, const char *url, const char *wait,
            ctx, eurl, wait);
 
   Buf out;
+  buf_init(&out);
   if (cli_call_t(trame, &out, timeout_s) != EXIT_OK) {
     buf_free(&out);
     return EXIT_ERR;
@@ -481,6 +492,7 @@ static int cmd_f5(int n, int want_wait) {
            ctxs[n], want_wait ? "complete" : "none");
 
   Buf out;
+  buf_init(&out);
   if (cli_call_t(trame, &out, want_wait ? 60 : 10) != EXIT_OK) {
     buf_free(&out);
     return EXIT_ERR;
@@ -492,6 +504,331 @@ static int cmd_f5(int n, int want_wait) {
   return err ? EXIT_ERR : EXIT_OK;
 }
 
+/* Collecte les contextIds des iframes DIRECTES de l'onglet `top` :
+ * la réponse getTree imbrique les enfants dans le champ "children" de
+ * l'objet parent (il n'existe PAS de champ "parent" côté enfant —
+ * constat 2026-08-12). Retourne le nombre trouvé. */
+static int collect_children(const char *doc, size_t len, const char *top,
+                            char ids[][64], int max) {
+  size_t rs = 0, re = 0, cs = 0, ce = 0;
+  if (json_value_bounds(doc, len, "result", &rs, &re) != 1) return 0;
+  if (json_value_bounds(doc + rs, re - rs, "contexts", &cs, &ce) != 1) return 0;
+  const char *arr = doc + rs + cs;
+  size_t pos = 1, s = 0, e = 0;
+  while (json_array_next(arr, ce - cs, &pos, &s, &e) > 0) {
+    size_t vs = 0, ve = 0;
+    if (json_get_str_bounds(arr + s, e - s, "context", &vs, &ve) != JSON_STR)
+      continue;
+    size_t tl = ve - vs;
+    if (tl != strlen(top) || memcmp(arr + s + vs, top, tl) != 0) continue;
+    /* l'onglet trouvé : liste ses enfants (le champ children, tableau) */
+    size_t chs = 0, che = 0;
+    if (json_value_bounds(arr + s, e - s, "children", &chs, &che) != 1)
+      return 0;
+    const char *ch = arr + s + chs;
+    if (ch[0] != '[') return 0;
+    size_t p2 = 1, s2 = 0, e2 = 0;
+    int k = 0;
+    while (k < max && json_array_next(ch, che - chs, &p2, &s2, &e2) > 0) {
+      size_t cvs = 0, cve = 0;
+      if (json_get_str_bounds(ch + s2, e2 - s2, "context", &cvs, &cve)
+          != JSON_STR) continue;
+      size_t l = cve - cvs < 63 ? cve - cvs : 63;
+      memcpy(ids[k], ch + s2 + cvs, l);
+      ids[k][l] = '\0';
+      k++;
+    }
+    return k;
+  }
+  return 0;
+}
+
+/* Le socle de l'extraction d'onglet : un script.evaluate sur le contexte,
+ * la valeur (string JSON) est DÉSÉCHAPPÉE dans out → contenu réel brut. */
+static int evaluate_ctx_t(const char *ctx, const char *expression, Buf *out,
+                          int timeout_s) {
+  char trame[6000];
+  snprintf(trame, sizeof(trame),
+           "{\"id\":3,\"method\":\"script.evaluate\",\"params\":{"
+           "\"expression\":\"%s\","
+           "\"target\":{\"context\":\"%.63s\"},"
+           "\"awaitPromise\":false,\"resultOwnership\":\"none\"}}",
+           expression, ctx);
+  Buf raw;
+  if (cli_call_t(trame, &raw, timeout_s) != EXIT_OK) return -1;
+  size_t vs = 0, ve = 0;
+  if (get_script_value(raw.data, raw.len, &vs, &ve) != 0) {
+    log_err("script.evaluate: unexpected response");
+    buf_free(&raw);
+    return -1;
+  }
+  buf_reset(out);
+  if (json_unescape(out, raw.data + vs, ve - vs) != 0) {
+    buf_free(&raw);
+    return -1;
+  }
+  buf_free(&raw);
+  return 0;
+}
+
+static int evaluate_ctx(const char *ctx, const char *expression, Buf *out) {
+  /* 120 s : le pont peut marquer une pause de ~30 s en plein milieu
+   * d'une grosse sérialisation (constat 2026-08-12, google 3,2 Mo) */
+  return evaluate_ctx_t(ctx, expression, out, 120);
+}
+
+/* ffsr get child <N> — le HTML des iframes de l'onglet : getTree
+ * maxDepth:1 (les enfants directs seulement — l'arbre complet multi-Mo
+ * dépasse la gestion de fragmentation du tunnel, constat 2026-08-12)
+ * → les contextes dont le parent est l'onglet → leur outerHTML,
+ * séparés par des lignes de contexte. Sortie brute (on itérera). */
+static int get_child(const char *top_ctx) {
+  Buf out;
+  if (cli_call("{\"id\":2,\"method\":\"browsingContext.getTree\","
+               "\"params\":{\"maxDepth\":1}}", &out) != EXIT_OK)
+    return EXIT_ERR;
+  char ids[64][64];
+  int n = collect_children(out.data, out.len, top_ctx, ids, 64);
+  buf_free(&out);
+
+  int printed = 0;
+  for (int i = 0; i < n; i++) {
+    printf("===== %s =====\n", ids[i]);
+    Buf h;
+    buf_init(&h);
+    if (evaluate_ctx(ids[i], "document.documentElement.outerHTML", &h) == 0) {
+      if (h.len > 0) fwrite(h.data, 1, h.len, stdout);
+      fputc('\n', stdout);
+      buf_free(&h);
+      printed++;
+    }
+  }
+  if (printed == 0) printf("(no child contexts in tab)\n");
+  return EXIT_OK;
+}
+
+/* ------------------------------------------------ get-file channel */
+
+/* Envoie une évaluation (trame BiDi complète) SANS écriture de la réponse
+ * sur stdout. La réponse du pont peut mettre ~10 s à venir ; on attend
+ * qu'elle arrive (cli_call) mais on la jette — le fichier du staging est
+ * la seule preuve. (send_trame ne convient pas : il imprime la réponse.) */
+static int send_eval_no_wait(const char *ctx, const char *expr) {
+  Buf j;
+  buf_init(&j);
+  buf_puts(&j, "{\"id\":3,\"method\":\"script.evaluate\",\"params\":{\"expression\":\"");
+  json_escape(&j, expr, strlen(expr));
+  buf_puts(&j, "\",\"target\":{\"context\":\"");
+  json_escape(&j, ctx, strlen(ctx));
+  buf_puts(&j, "\"},\"awaitPromise\":false,\"resultOwnership\":\"none\"}}");
+  Buf out;
+  buf_init(&out);
+  int rc = cli_call(j.data ? j.data : "", &out);
+  buf_free(&out);
+  buf_free(&j);
+  return rc == EXIT_OK ? 0 : -1;
+}
+
+/* Clic download d'un Blob du rendu (outerHTML) : Firefox écrit le
+ * fichier binaire dans le staging, SANS sérialisation BiDi (le goulot).
+ * On n'attend AUCUNE réponse : le fichier qui apparaît dans le staging
+ * est la seule preuve. */
+static int blob_download(const char *ctx, int n) {
+  char expr[2200];
+  snprintf(expr, sizeof(expr),
+           "(()=>{const s=document.documentElement.outerHTML;"
+           "const b=new Blob([s],{type:'text/html'});"
+           "const a=document.createElement('a');a.href=URL.createObjectURL(b);"
+           "a.download='ffsr_get%d.html';"
+           "document.body.appendChild(a);a.click();return s.length})()", n);
+  return send_eval_no_wait(ctx, expr);
+}
+
+/* Clic download de la SOURCE (l'URL de l'onglet) — mp4, images, HTML brut.
+ * Même principe : envoi sans attente de réponse. */
+static int src_download(const char *ctx, int n, const char *url) {
+  Buf jurl;
+  buf_init(&jurl);
+  buf_puts(&jurl, "\"");
+  if (json_escape(&jurl, url, strlen(url)) != 0 || buf_puts(&jurl, "\"") != 0) {
+    buf_free(&jurl);
+    return -1;
+  }
+  char expr[4600];
+  snprintf(expr, sizeof(expr),
+           "(()=>{const a=document.createElement('a');a.href=%s;"
+           "a.download='ffsr_src%d';"
+           "document.body.appendChild(a);a.click();return 'ok'})()",
+           jurl.data ? jurl.data : "\"\"", n);
+  buf_free(&jurl);
+  return send_eval_no_wait(ctx, expr);
+}
+
+/* Cherche un fichier du staging (nom exact, ou préfixe si src=1 car
+ * l'extension MIME est choisie par Firefox). Si présent ET stable (2
+ * stats identiques à 1 s : écriture terminée) : lit, purge, 0. */
+static int read_staging(const char *name, int src, Buf *out) {
+  DIR *dir = opendir(STAGING_DIR);
+  if (!dir) return -1;
+  char found[512] = "";
+  size_t nlen = strlen(name);
+  struct dirent *e;
+  while ((e = readdir(dir)) != NULL) {
+    if (src) {
+      if (strncmp(e->d_name, name, nlen) == 0 &&
+          (e->d_name[nlen] == '.' || e->d_name[nlen] == '\0')) {
+        snprintf(found, sizeof(found), "%s/%s", STAGING_DIR, e->d_name);
+        break;
+      }
+    } else if (strcmp(e->d_name, name) == 0) {
+      snprintf(found, sizeof(found), "%s/%s", STAGING_DIR, e->d_name);
+      break;
+    }
+  }
+  closedir(dir);
+  if (found[0] == '\0') return -1;
+
+  struct stat a, b;
+  if (stat(found, &a) != 0 || a.st_size <= 0) return -1;
+  sleep(1);
+  if (stat(found, &b) != 0 || b.st_size != a.st_size) return -1;
+
+  FILE *f = fopen(found, "rb");
+  if (!f) return -1;
+  buf_reset(out);
+  char buf[65536];
+  size_t r;
+  while ((r = fread(buf, 1, sizeof(buf), f)) > 0) buf_append(out, buf, r);
+  fclose(f);
+  remove(found);
+  return 0;
+}
+
+/* Poll du staging : 1×/s, timeout global — le pont met 10-120 s à se
+ * libérer d'une sérialisation abandonnée avant que le clic ne parte. */
+static int wait_staging(const char *name, int src, Buf *out) {
+  for (int i = 0; i < FALLBACK_TO; i++) {
+    if (read_staging(name, src, out) == 0) return 0;
+    sleep(1);
+  }
+  return -1;
+}
+
+/* ffsr get file <N> [w] [-src] : le canal binaire. Sans w : clic →
+ * retour immédiat (le LLM rappelle la commande pour lire le fichier
+ * une fois écrit). Avec w : clic + poll 1×/s → stdout. */
+static int cmd_get_file(int n, int want_wait, int src) {
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    log_err("dedicated window not found — no tabs?");
+    return EXIT_ERR;
+  }
+  if (n >= count) {
+    log_err("tab %d out of range: dedicated window has %d tab(s)", n, count);
+    return EXIT_BADARGS;
+  }
+
+  char name[64];
+  snprintf(name, sizeof(name), src ? "ffsr_src%d" : "ffsr_get%d.html", n);
+
+  Buf out;
+  buf_init(&out);
+  if (read_staging(name, src, &out) == 0) {
+    /* binaire EXACT : pas de '\n' final (le sha doit correspondre) */
+    if (out.len > 0) fwrite(out.data, 1, out.len, stdout);
+    buf_free(&out);
+    return EXIT_OK;
+  }
+  buf_free(&out);
+
+  int rc = src ? src_download(ctxs[n], n, urls[n]) : blob_download(ctxs[n], n);
+  if (rc != 0) {
+    log_err("get file: download click failed (bridge busy?) — retry");
+    return EXIT_ERR;
+  }
+  if (!want_wait) {
+    printf("(download launched — retry `ffsr get file %d%s` in ~5 s)\n", n,
+           src ? " -src" : "");
+    return EXIT_OK;
+  }
+
+  buf_init(&out);
+  if (wait_staging(name, src, &out) != 0) {
+    log_err("get file: no file within %ds", FALLBACK_TO);
+    buf_free(&out);
+    return EXIT_ERR;
+  }
+  if (out.len > 0) fwrite(out.data, 1, out.len, stdout);
+  buf_free(&out);
+  return EXIT_OK;
+}
+
+/* ffsr get [html|txt|net|child|file] <N> [w] [-src] — LE socle groupé des
+ * extractions (HTML, texte visible, instantané réseau = la même mécanique,
+ * seule l'expression change ; child = boucle des iframes ; file = canal
+ * binaire blob/source). Sortie BRUTE. */
+static int cmd_get(const char *type, int n, int want_wait) {
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    log_err("dedicated window not found — no tabs?");
+    return EXIT_ERR;
+  }
+  if (n >= count) {
+    log_err("tab %d out of range: dedicated window has %d tab(s)", n, count);
+    return EXIT_BADARGS;
+  }
+
+  if (strcmp(type, "child") == 0) return get_child(ctxs[n]);
+  if (strcmp(type, "file") == 0) return cmd_get_file(n, want_wait, 0);
+
+  const char *expr = NULL;
+  if (strcmp(type, "html") == 0)
+    expr = "document.documentElement.outerHTML";
+  else if (strcmp(type, "txt") == 0)
+    expr = "document.body.innerText";
+  else if (strcmp(type, "net") == 0)
+    expr = "JSON.stringify(performance.getEntriesByType('resource'))";
+  else
+    return EXIT_BADARGS;
+
+  Buf out;
+  buf_init(&out);
+  /* La tentative directe : sérialisée par le pont. Timeout court — si le
+   * sérialiseur s'engorge (pages lourdes, pont occupé), le fallback blob
+   * prend le relais (même contenu : le rendu), par le disque, sans limite. */
+  if (evaluate_ctx_t(ctxs[n], expr, &out, SERIALIZE_TO) != 0) {
+    buf_free(&out);
+    if (strcmp(type, "html") != 0) {
+      log_err("get %s: serialization failed", type);
+      return EXIT_ERR;
+    }
+    log_err("serialization failed — falling back to the binary channel");
+    Buf fb;
+    buf_init(&fb);
+    char name[64];
+    snprintf(name, sizeof(name), "ffsr_get%d.html", n);
+    if (blob_download(ctxs[n], n) == 0 && wait_staging(name, 0, &fb) == 0) {
+      if (fb.len > 0) fwrite(fb.data, 1, fb.len, stdout);
+      fputc('\n', stdout);
+      buf_free(&fb);
+      return EXIT_OK;
+    }
+    buf_free(&fb);
+    log_err("fallback failed (bridge busy?) — retry");
+    return EXIT_ERR;
+  }
+  if (out.len > 0) fwrite(out.data, 1, out.len, stdout);
+  fputc('\n', stdout);
+  buf_free(&out);
+  return EXIT_OK;
+}
+
 static int show_usage(void) {
   printf("ffsr — FireFox Simple Relay (CLI)\n"
          "usage:\n"
@@ -500,6 +837,13 @@ static int show_usage(void) {
          "  ffsr search                | list the accepted search engines\n"
          "  ffsr search go <tabs,> <query> | parallel search (position=1 google, 2 paulgo, 3 startpage, 4 ddg; empty position = skip)\n"
          "  ffsr f5 <N 0-9> [w]        | hard reload of tab N (cache bypass)\n"
+         "  ffsr get <N 0-9>           | full HTML of tab N (outerHTML; fallback: binary channel)\n"
+         "  ffsr get txt <N 0-9>       | visible text of tab N (innerText)\n"
+         "  ffsr get net <N 0-9>       | network snapshot of tab N (resource entries)\n"
+         "  ffsr get child <N 0-9>     | HTML of tab N's iframes (child contexts)\n"
+         "  ffsr get file <N 0-9> [w]  | binary channel: rendered DOM of tab N\n"
+         "                             |   (no 'w': click + immediate return, LLM polls)\n"
+         "  ffsr get file <N 0-9> -src [w] | raw source of tab N's URL (mp4, images...)\n"
          "  ffsr <json-bidi-frame>     | send the raw BiDi frame via the tunnel\n"
          "  ffsr d status              | service status (systemctl)\n"
          "  ffsr d start               | systemctl start ffsrd.service\n"
@@ -569,6 +913,62 @@ int main(int argc, char **argv) {
       return cmd_search_go(argv[3], argv[4]);
     log_err("usage: ffsr search | ffsr search go <tabs 0-9,0-9> <query>");
     return EXIT_BADARGS;
+  }
+
+  /* ffsr get [html|txt|net|child|file] <N> [w] [-src] — extraction onglet N */
+  if (strcmp(argv[1], "get") == 0) {
+    if (argc < 3 || argc > 6) {
+      log_err("usage: ffsr get [html|txt|net|child|file] <N 0-9> [w] [-src]");
+      return EXIT_BADARGS;
+    }
+    const char *type = "html";
+    const char *ns = argv[2];
+    int want_wait = 0, src = 0;
+    if (argc == 4) {
+      if (strcmp(argv[2], "w") == 0) {
+        want_wait = 1;
+        ns = argv[3];
+      } else {
+        type = argv[2];
+        ns = argv[3];
+      }
+    } else if (argc == 5) {
+      type = argv[2];
+      ns = argv[3];
+      if (strcmp(argv[4], "w") == 0) want_wait = 1;
+      else if (strcmp(argv[4], "-src") == 0) src = 1;
+      else {
+        log_err("unknown 4th argument '%s' (expected: w|-src)", argv[4]);
+        return EXIT_BADARGS;
+      }
+    } else if (argc == 6) {
+      type = argv[2];
+      ns = argv[3];
+      if (strcmp(argv[4], "-src") != 0 || strcmp(argv[5], "w") != 0) {
+        log_err("usage: ffsr get file <N> -src w");
+        return EXIT_BADARGS;
+      }
+      src = 1;
+      want_wait = 1;
+    }
+    if (strcmp(type, "html") != 0 && strcmp(type, "txt") != 0 &&
+        strcmp(type, "net") != 0 && strcmp(type, "child") != 0 &&
+        strcmp(type, "file") != 0) {
+      log_err("unknown get type '%s' (expected: html|txt|net|child|file)", type);
+      return EXIT_BADARGS;
+    }
+    if (src && strcmp(type, "file") != 0) {
+      log_err("-src is only valid with `get file`");
+      return EXIT_BADARGS;
+    }
+    char *end = NULL;
+    long n = strtol(ns, &end, 10);
+    if (!end || *end != '\0' || n < 0 || n > 9) {
+      log_err("N must be an integer between 0 and 9");
+      return EXIT_BADARGS;
+    }
+    if (strcmp(type, "file") == 0) return cmd_get_file((int)n, want_wait, src);
+    return cmd_get(type, (int)n, want_wait);
   }
 
   /* ffsr f5 <N> [w] — hard reload (cache bypass) of tab N */

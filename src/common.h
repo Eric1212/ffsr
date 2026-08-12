@@ -84,4 +84,11 @@ char *xstrdup(const char *s);
 /* true if the path exists (stat) */
 bool  file_exists(const char *path);
 
+/* Ask the kernel for the max socket buffers (SO_RCVBUF + SO_SNDBUF,
+ * clamped to the system max): heavy payloads must pass through. */
+void  set_sock_buffers(int fd);
+
+/* Write everything, retrying on partial writes. Returns 0 or -1. */
+int   write_all(int fd, const char *data, size_t len);
+
 #endif /* COMMON_H */

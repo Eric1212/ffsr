@@ -87,6 +87,15 @@ static void client_close_slot(int slot) {
   }
   clients[slot].fd = -1;
   buf_reset(&clients[slot].in);
+  /* Purge the pending of this client: a response arriving late (slow
+   * iframe, etc.) after its disconnect must NEVER be routed to the
+   * recycled fd of another client — cross-corruption bug found
+   * 2026-08-12 during the get child testing. */
+  for (int i = 0; i < MAX_PENDING; i++)
+    if (pending[i].used && pending[i].fd == fd) {
+      pending[i].used = 0;
+      log_msg("pending (id_global %ld) purged on disconnect", pending[i].id_global);
+    }
   log_msg("client #%d disconnected", slot);
 }
 
@@ -384,6 +393,7 @@ static int ws_connect_firefox(void) {
     return -1;
   }
   curl_easy_getinfo(g_curl, CURLINFO_ACTIVESOCKET, &g_wsfd);
+  set_sock_buffers(g_wsfd);   /* heavy WS payloads must pass through */
   g_ws_alive = 1;   /* from here on: every error path must return the session */
   log_msg("WS connected to %s (fd %d)", WS_URL, g_wsfd);
 
@@ -416,6 +426,24 @@ static int ws_connect_firefox(void) {
   } else {
     log_err("no session.new response");
     return -1;
+  }
+
+  /* get-file channel (2026-08-12) : Firefox écrit les blobs téléchargés
+   * ici — le CLI les lit, les sert sur stdout, puis les purge. */
+  if (mkdir("/tmp/ffsr", 0777) != 0 && errno != EEXIST) {
+    log_msg("warning: cannot mkdir /tmp/ffsr (errno %d)", errno);
+  }
+  chmod("/tmp/ffsr", 0777);
+  if (ws_command("browser.setDownloadBehavior",
+                 "{\"downloadBehavior\":{\"type\":\"allowed\","
+                 "\"destinationFolder\":\"/tmp/ffsr\"}}") != 0) {
+    log_msg("warning: browser.setDownloadBehavior failed");
+  } else {
+    rep = ws_wait_daemon_response(HANDSHAKE_TO);
+    if (rep && strstr(rep, "\"type\":\"success\"") == NULL)
+      log_msg("setDownloadBehavior response: %s", rep);
+    free((void *)rep);
+    log_msg("download behavior: allowed → /tmp/ffsr");
   }
   return 0;
 }
@@ -483,13 +511,15 @@ static void relay_message(const char *data, size_t len) {
       char *t = rewrite_id(data, len, id_client);
       if (t) {
         size_t tl = strlen(t);
-        ssize_t w = write(fd, t, tl);
-        if (w != (ssize_t)tl) log_msg("client fd %d: partial write", fd);
+        log_msg("TRC relais: %zu octets vers fd %d — %.80s",
+                tl, fd, t);
+        if (write_all(fd, t, tl) != 0)
+          log_msg("client fd %d: write failed", fd);
         free(t);
       } else {
         /* no id in the response: relayed as-is */
-        ssize_t w = write(fd, data, len);
-        if (w != (ssize_t)len) log_msg("client fd %d: partial write", fd);
+        if (write_all(fd, data, len) != 0)
+          log_msg("client fd %d: write failed", fd);
       }
       /* flight 2 convention: one response per connection → close */
       for (int c = 0; c < MAX_CLIENTS; c++) {
@@ -522,6 +552,12 @@ static void ws_to_clients(void) {
   }
 
   buf_append(&g_wsbuf, buf, n);
+  /* TRACE TEMPORAIRE 2026-08-12 (diagnostic fragmentation) — retirée
+   * après stabilisation. */
+  log_msg("TRC ws frame: n=%zu bytesleft=%d cont=%d bin=%d total=%zu",
+          n, meta ? (int)meta->bytesleft : -1,
+          meta ? !!(meta->flags & CURLWS_CONT) : -1,
+          meta ? !!(meta->flags & CURLWS_BINARY) : -1, g_wsbuf.len);
   /* message incomplete as long as the frame has remaining bytes —
    * CURLWS_CONT is not enough: the FIRST fragment of a frame is not
    * CONT (bug of the serial recreations, fixed) */
@@ -882,8 +918,7 @@ static void handle_window_client(int cfd) {
   }
   char out[96];
   int n = snprintf(out, sizeof(out), "%s\n", g_win_hint);
-  ssize_t w = write(cfd, out, (size_t)n);
-  if (w != n) log_msg("window.sock: partial write");
+  if (write_all(cfd, out, (size_t)n) != 0) log_msg("window.sock: write failed");
   log_msg("window.sock: dedicated window -> %s", g_win_hint);
   close(cfd);
 }
@@ -976,6 +1011,7 @@ int main(int argc, char **argv) {
     if (FD_ISSET(listen_fd, &rfds)) {
       int cfd = accept(listen_fd, NULL, NULL);
       if (cfd >= 0) {
+        set_sock_buffers(cfd);   /* heavy responses must pass through */
         int slot = -1;
         for (int i = 0; i < MAX_CLIENTS; i++) {
           if (clients[i].fd < 0) { slot = i; break; }
