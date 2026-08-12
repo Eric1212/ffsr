@@ -1,5 +1,5 @@
 /*
- * common.c — implémentation des helpers partagés.
+ * common.c — implementation of the shared helpers.
  */
 
 #include "common.h"
@@ -71,14 +71,14 @@ void buf_reset(Buf *b) {
   if (b->data) b->data[0] = '\0';
 }
 
-/* -------------------------------------------------------------- log */
+/* ---------------------------------------------------------------- log */
 
-/* Fichier de log du daemon (NULL = stderr uniquement).
- * Ouvert par log_set_file(); écrit avant stderr, timestampé.
- * Rotation (trimmer) : dès que le fichier dépasse LOG_MAX_BYTES, il est
- * renommé en "<path>.old" (en écrasant l'ancien .old) et on repart à
- * neuf — le fichier de log est toujours borné ~2× la limite. */
-#define LOG_MAX_BYTES (1024 * 1024)     /* 1 Mo avant rotation */
+/* Daemon log file (NULL = stderr only).
+ * Opened by log_set_file(); written before stderr, timestamped.
+ * Rotation (trimmer): as soon as the file exceeds LOG_MAX_BYTES, it is
+ * renamed to "<path>.old" (overwriting the previous .old) and a fresh
+ * one starts — the log file is always bounded to ~2× the limit. */
+#define LOG_MAX_BYTES (1024 * 1024)     /* 1 Mo before rotation */
 
 static FILE *g_log_fp = NULL;
 static char  g_log_path[512] = "";
@@ -105,18 +105,18 @@ static void log_rotate_if_needed(void) {
   fclose(g_log_fp);
   char old[sizeof(g_log_path) + 4];
   snprintf(old, sizeof(old), "%s.old", g_log_path);
-  /* rename écrase silencieusement un éventuel .old précédent */
+  /* rename silently overwrites a previous .old */
   rename(g_log_path, old);
-  g_log_fp = fopen(g_log_path, "a");   /* fichier neuf */
+  g_log_fp = fopen(g_log_path, "a");   /* fresh file */
   if (g_log_fp) {
-    fprintf(g_log_fp, "--- rotation (ancien log dans %s) ---\n", old);
+    fprintf(g_log_fp, "--- rotation (previous log in %s) ---\n", old);
   }
 }
 
 static void log_write(const char *tag, const char *fmt, va_list ap) {
   if (g_log_fp) {
     va_list apf;
-    va_copy(apf, ap);   /* COPIE avant tout usage : ap doit rester intact */
+    va_copy(apf, ap);   /* COPY before any use: ap must stay intact */
     struct timeval tv;
     gettimeofday(&tv, NULL);
     struct tm tm;
@@ -127,11 +127,11 @@ static void log_write(const char *tag, const char *fmt, va_list ap) {
     vfprintf(g_log_fp, fmt, apf);
     va_end(apf);
     fputc('\n', g_log_fp);
-    fflush(g_log_fp); /* crash-safe : la ligne est écrite même en kill -9 */
+    fflush(g_log_fp); /* crash-safe: the line is written even on kill -9 */
     log_rotate_if_needed();
   }
   fprintf(stderr, "[ffsr] %s", tag);
-  vfprintf(stderr, fmt, ap);   /* ap n'a JAMAIS été consommé : intact */
+  vfprintf(stderr, fmt, ap);   /* ap has NEVER been consumed: intact */
   fputc('\n', stderr);
 }
 
@@ -149,7 +149,7 @@ void log_err(const char *fmt, ...) {
   va_end(ap);
 }
 
-/* ------------------------------------------------------- JSON minimal */
+/* ------------------------------------------------------- minimal JSON */
 
 int json_escape(Buf *b, const char *s, size_t n) {
   static const char hex[] = "0123456789abcdef";
@@ -188,7 +188,7 @@ int json_unescape(Buf *b, const char *s, size_t n) {
         case 'r':  if (buf_append(b, "\r", 1) != 0) return -1; break;
         case 'b':  if (buf_append(b, "\b", 1) != 0) return -1; break;
         case 'f':  if (buf_append(b, "\f", 1) != 0) return -1; break;
-        default:   /* \uXXXX : on garde brut (rare ici) */
+        default:   /* \uXXXX: kept raw (rare here) */
           if (buf_append(b, "\\", 1) != 0) return -1;
           if (buf_append(b, &nxt, 1) != 0) return -1;
       }
@@ -203,7 +203,7 @@ JsonVal json_get(const char *doc, size_t len, const char *key,
                  const char **str, long *num) {
   size_t klen = strlen(key);
   size_t i = 0;
-  /* saute les blancs et l'accolade ouvrante */
+  /* skip whitespace and the opening brace */
   while (i < len && (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\n')) i++;
   if (i >= len || doc[i] != '{') return JSON_NOTFOUND;
   i++;
@@ -213,24 +213,24 @@ JsonVal json_get(const char *doc, size_t len, const char *key,
     if (i >= len) return JSON_NOTFOUND;
     if (doc[i] != '"') return JSON_NOTFOUND;
     i++;
-    /* lire la clé */
+    /* read the key */
     size_t ks = i;
     while (i < len && doc[i] != '"') i++;
     if (i >= len) return JSON_NOTFOUND;
     size_t ke = i;
     i++;
-    /* deux-points */
+    /* colon */
     while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
     if (i >= len || doc[i] != ':') return JSON_NOTFOUND;
     i++;
     while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
     if (i >= len) return JSON_NOTFOUND;
-    /* valeur : string */
+    /* value: string */
     if (doc[i] == '"') {
       i++;
       size_t vs = i;
       while (i < len && doc[i] != '"') {
-        if (doc[i] == '\\') i++;   /* saute l'échappement */
+        if (doc[i] == '\\') i++;   /* skip the escape */
         i++;
       }
       if (i >= len) return JSON_NOTFOUND;
@@ -238,10 +238,10 @@ JsonVal json_get(const char *doc, size_t len, const char *key,
         if (str) *str = doc + vs;
         return JSON_STR;
       }
-      i++; /* ferme la string, continue la boucle */
+      i++; /* close the string, continue the loop */
       continue;
     }
-    /* valeur : nombre (id) */
+    /* value: number (id) */
     if (isdigit((unsigned char)doc[i]) || doc[i] == '-') {
       size_t vs = i;
       while (i < len && (isdigit((unsigned char)doc[i]) || doc[i] == '-')) i++;
@@ -254,7 +254,7 @@ JsonVal json_get(const char *doc, size_t len, const char *key,
       }
       continue;
     }
-    /* valeur : objet / tableau imbriqué (on saute sans chercher dedans) */
+    /* value: nested object / array (skip without searching inside) */
     if (doc[i] == '{' || doc[i] == '[') {
       char open = doc[i], close = open == '{' ? '}' : ']';
       int depth = 0;
@@ -274,13 +274,13 @@ JsonVal json_get(const char *doc, size_t len, const char *key,
       }
       continue;
     }
-    /* valeur : littéral (null/true/false) */
+    /* value: literal (null/true/false) */
     {
       size_t vs = i;
       while (i < len && doc[i] != ',' && doc[i] != '}') i++;
       size_t vl = i - vs;
       if (klen == ke - ks && memcmp(doc + ks, key, klen) == 0) {
-        /* true/false → JSON_NUM (1/0) ; null → pas une valeur */
+        /* true/false → JSON_NUM (1/0) ; null → not a value */
         if ((vl == 4 && memcmp(doc + vs, "true", 4) == 0)) {
           if (num) *num = 1;
           return JSON_NUM;
@@ -296,7 +296,7 @@ JsonVal json_get(const char *doc, size_t len, const char *key,
   }
 }
 
-/* ------------------------------------------------------- JSON bornes */
+/* --------------------------------------------------------- JSON bounds */
 
 JsonVal json_get_str_bounds(const char *doc, size_t len, const char *key,
                             size_t *start, size_t *end) {
@@ -320,8 +320,8 @@ JsonVal json_get_str_bounds(const char *doc, size_t len, const char *key,
     i++;
     while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
     if (i >= len) return JSON_NOTFOUND;
-    /* valeur non-string (null/littéral/objet/tableau) : on la saute et
-     * on continue — la clé cherchée peut être plus loin dans l'objet */
+    /* non-string value (null/literal/object/array): skip it and
+     * continue — the searched key may be further in the object */
     if (doc[i] != '"') {
       if (doc[i] == '{' || doc[i] == '[') {
         char open = doc[i], close = open == '{' ? '}' : ']';
@@ -362,7 +362,7 @@ JsonVal json_get_str_bounds(const char *doc, size_t len, const char *key,
   }
 }
 
-/* Localise la valeur du champ `key` de premier niveau : bornes [start,end). */
+/* Locates the value of the top-level `key` field: bounds [start,end). */
 int json_value_bounds(const char *doc, size_t len, const char *key,
                       size_t *start, size_t *end) {
   size_t klen = strlen(key);
@@ -385,7 +385,7 @@ int json_value_bounds(const char *doc, size_t len, const char *key,
     i++;
     while (i < len && (doc[i] == ' ' || doc[i] == '\t')) i++;
     if (i >= len) return -1;
-    /* valeur : string, nombre, objet, tableau ou littéral */
+    /* value: string, number, object, array or literal */
     size_t vs = i, ve = vs;
     if (doc[i] == '"') {
       i++;
@@ -395,7 +395,7 @@ int json_value_bounds(const char *doc, size_t len, const char *key,
         i++;
       }
       ve = i;
-      i++; /* ferme la string */
+      i++; /* close the string */
     } else if (doc[i] == '{' || doc[i] == '[') {
       char open = doc[i], close = open == '{' ? '}' : ']';
       int depth = 0;
@@ -426,8 +426,8 @@ int json_value_bounds(const char *doc, size_t len, const char *key,
   }
 }
 
-/* Itérateur de tableau : `pos` doit démarrer à la position après '['.
- * Retourne 0 (fini), 1 (élément trouvé dans [start,end)), -1 (malformé). */
+/* Array iterator: `pos` must start at the position after '['.
+ * Returns 0 (done), 1 (element found in [start,end)), -1 (malformed). */
 int json_array_next(const char *arr, size_t len, size_t *pos,
                     size_t *start, size_t *end) {
   size_t i = *pos;
@@ -459,7 +459,7 @@ int json_array_next(const char *arr, size_t len, size_t *pos,
   return -1;
 }
 
-/* ---------------------------------------------------------- utils */
+/* ------------------------------------------------------------ utils */
 
 char *xstrdup(const char *s) {
   size_t n = strlen(s) + 1;

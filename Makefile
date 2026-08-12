@@ -1,4 +1,4 @@
-# ffsr — Makefile (spec : make = 2 binaires ; make install = système)
+# ffsr — Makefile (spec: make = 2 binaries; make install = system)
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra
@@ -33,8 +33,8 @@ install: all
 	@echo "==> systemctl daemon-reload && systemctl enable --now ffsrd"
 	-systemctl daemon-reload
 	-systemctl enable ffsrd.service
-	# restart (pas --now) : un service déjà actif garde l'ANCIEN binaire en
-	# mémoire — chaque make install doit être effectif immédiatement.
+	# restart (not --now): an already active service keeps the OLD binary
+	# in memory — every make install must be effective immediately.
 	-systemctl restart ffsrd.service
 
 uninstall:

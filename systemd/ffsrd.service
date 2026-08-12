@@ -11,14 +11,14 @@ RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 
-# Répertoires gérés par systemd (créés au start, purgés au stop)
-# RuntimeDirectoryMode=0755 : CRITIQUE — eric (le CLI, uid 1000) doit
-# pouvoir pénétrer /run/ffsrd pour atteindre le socket chowné.
+# Directories managed by systemd (created at start, purged at stop)
+# RuntimeDirectoryMode=0755: CRITICAL — eric (the CLI, uid 1000) must
+# be able to enter /run/ffsrd to reach the chowned socket.
 RuntimeDirectory=ffsrd
 RuntimeDirectoryMode=0755
 StateDirectory=ffsrd
 
-# Hardening (calqué sur ram-reclaim.service de la machine de référence)
+# Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
