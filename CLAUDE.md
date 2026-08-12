@@ -16,7 +16,11 @@ vérifications), en contrôlant une fenêtre Firefox dédiée, visible et unique
 ## État
 
 - 2026-08-11 : dépôt initialisé. Fonctionnement défini (structure + mécanique
-  validées empiriquement sur le pont vivant). Implémentation à venir.
+  validées empiriquement sur le pont vivant).
+- 2026-08-11 (suite) : **décision d'architecture** — binôme **ffsrd (daemon) +
+  ffsr (CLI)** : voir « Architecture ffsrd ⇄ ffsr » ci-dessous. La possession
+  de la session passe au daemon ; les CLI ne parlent jamais à Firefox.
+  Implémentation à venir.
 
 ## Stack
 
@@ -55,26 +59,86 @@ complète 0-9 étant validée empiriquement (facilité déconcertante), ffsr gè
   affiché à la création (validé : l'onglet `about:blank` initial a reçu google.ca).
 - Mapping index → contextId maintenu dans l'état persistant (voir plus bas).
 
-### Flux BiDi par commande (session atomique)
+## Architecture ffsrd ⇄ ffsr (décision 2026-08-11, validée avec Éric)
+
+Deux binaires, rôles stricts — un WebSocket ne peut jamais « appartenir à un
+utilisateur », il appartient toujours à un processus (prouvé). La meilleure
+approximation : un daemon dédié (PID stable, vivant comme la session
+utilisateur) qui détient SOLE possession de la connexion et de la session.
 
 ```
-session.new → (trouver fenêtre dédiée) → action(s) → session.end (TOUJOURS)
+Firefox (9222) ◄──WS unique── ffsrd (passthrough pur, détient la session)
+                               │
+                          socket Unix local (ffsr.sock)
+                               ▲
+                          ffsr (CLI) — ne touche JAMAIS Firefox directement
 ```
 
-- `session.end` exécuté même en erreur (goto cleanup) — anti-zombie, une
-  session active max par navigateur ; sans lui le pont refuse (`session not
-  created` / « Maximum sessions »).
-- Navigation : `browsingContext.navigate {context, url, wait:"complete"}`.
+### ffsrd — le daemon passthrough
+
+- **Simple par nature** (validé Éric) : relais pur, aucune logique métier.
+  Reçoit les demandes JSON des CLI → les transfère TELLES QUELLES sur le WS ;
+  route les réponses par `id` (multiplexage validé : plusieurs demandes
+  simultanées dans la même session).
+- Ouvre `ws://127.0.0.1:9222/session` et crée la session UNE seule fois, au
+  démarrage. Il vit en silence ensuite (persistance idle prouvée : aucun
+  timeout serveur).
+- Seule intelligence : la VIE de la session. Jamais de mort sans rendre :
+  SIGINT/SIGTERM → `session.end` → sortie propre. Crash → le CLI relance un
+  ffsrd frais ; si le pont est verrouillé par un zombie (connexion morte sans
+  `session.end`), c'est le redémarrage Firefox qui purge (documenté).
+- **Sa complexité est dans l'installation** (validé Éric) : unit systemd
+  système (calquée sur `ram-reclaim.service` de la machine de référence :
+  `Type=simple`, `ExecStart=/usr/bin/ffsrd /etc/ffsrd/config`, `Restart=on-failure`
+  + `RestartSec=5s`, journal, hardening, `WantedBy=multi-user.target`,
+  `Environment=FFSRD_TARGET_UID=1000`). Le daemon EST root ; il agit pour
+  l'utilisateur cible quand nécessaire.
+- État persistant `/var/lib/ffsrd/state` maintenu par le daemon — **unique,
+  système, pas par-utilisateur** (une seule session Firefox, un seul état).
+
+### ffsr — le CLI
+
+- Parle au socket local du daemon (demandes/réponses JSON).
+- Ne connaît PAS le pont : toute la mécanique BiDi vit dans ffsrd.
+- **Pas d'auto-start** : le service systemd est `enabled` dès l'installation
+  (comme ram-reclaim) — le daemon tourne, point. `ffsr d …` pilote via
+  systemctl.
+
+### Contrat `ffsr d` (contrôle du daemon, validé)
+
+| Sous-commande | Comportement |
+|---|---|
+| `ffsr d status` | état du daemon + de la session (ex. : `daemon: actif (pid 1234, /run/ffsrd/ffsr.sock)` + `session: <id>` ou `aucune`) — passe par systemctl/journal |
+| `ffsr d start` | `systemctl start ffsrd.service` (le daemon est root, service système) ; « déjà actif » sinon ; il établit WS + session à son démarrage |
+| `ffsr d stop` | arrête proprement via le service : `session.end` AVANT de mourir (règle d'or), puis quitte |
+| `ffsr d restart` | `systemctl restart ffsrd.service` |
+
+### Flux BiDi (possession par le daemon)
+
+```
+Sous le daemon : session.new → (trouver fenêtre dédiée) → actions → la
+session RESTE OUVERTE — elle n'est fermée qu'au stop propre du daemon.
+```
+
+- La session est un bien unique et précieux : une seule session active max
+  par navigateur ; la perdre (connexion morte sans `session.end`) = pont
+  verrouillé jusqu'au redémarrage Firefox.
+- `session.status` = sonde non-créatrice (validée) : `ready:true` = libre,
+  `ready:false` + `"Session already started"` = occupée. À utiliser par le
+  daemon au démarrage avant tout `session.new`.
+- Le reste de la mécanique (fenêtre dédiée, onglets 0-9, navigation) est
+  inchangé par rapport aux sections ci-dessous.
 
 ## État persistant — survie au crash (design)
 
-But : si ffsr meurt en plein travail (kill, crash, coupure), l'état reste
-récupérable et réconciliable au prochain appel. Firefox est la SOURCE DE
+But : si ffsrd meurt en plein travail (kill, crash, coupure), l'état reste
+récupérable et réconciliable au prochain démarrage. Firefox est la SOURCE DE
 VÉRITÉ ; le fichier d'état est un CACHE de travail.
 
 ### Emplacement
 
-- `~/.local/state/ffsr/state` (XDG state dir) — répertoire créé par ffsr.
+- `/var/lib/ffsrd/state` (système, daemon root — session unique, état unique ;
+  jamais dans les homes des utilisateurs).
 
 ### Contenu (format texte simple, une clé par ligne)
 
@@ -106,27 +170,76 @@ nbtabs=<nombre d'onglets actifs>
 6. Si ffsr a crashé entre `create window` et l'écriture du state : fenêtre
    orpheline ignorée ; un `create` frais repart de zéro proprement.
 
+## Contrat CLI (fixé au fil des décisions)
+
+| Commande | Comportement fixé |
+|---|---|
+| **`ffsr go <N> <url>`** | navigue l'onglet N vers url (index explicite, en premier) ; `about:blank` vide l'onglet. Matrice PLEINE : à la création de la fenêtre dédiée, les 10 onglets existent déjà (9 × `create tab` après le contexte initial) — tout `go N` fonctionne du premier coup, aucune création conditionnelle. Diagnostique : après création, les 10 lignes de `tabs` doivent être `about:blank` — sinon anomalie |
+| **`ffsr tabs`** | TOUJOURS 10 lignes (0-9, jamais strippées), format `N - URL - title - Ko` ; title = valeur réelle de `document.title` (vide = `""`) ; Ko exacts sans arrondi (`about:blank` = `0.04 Ko`) ; sert de test de santé/diagnostic (remplace `ping`) |
+| **`ffsr search`** | PUR liste (comme `tabs`, aucune navigation) : affiche les moteurs de recherche acceptés avec leur URL, par ORDRE DE PRÉFÉRENCE : `google` → `https://www.google.com/search?q=` ; `paulgo` → `https://paulgo.io/search?q=` ; `startpage` → `https://www.startpage.com/sp/search?query=` ; `duckduckgo` → `https://html.duckduckgo.com/html/?q=`. La navigation se fait par `go` (l'IA compose l'URL). Vérifiés : google/startpage/ddg 200 ; paulgo 200 via navigateur réel (agrégateur → plus lent, attendre le chargement complet) |
+| **`ffsr search go <onglets> <requête>`** | lance la recherche <requête> EN PARALLÈLE sur plusieurs onglets, UN moteur par onglet, mapping POSITIONNEL (position 1=google, 2=paulgo, 3=startpage, 4=duckduckgo). Onglets séparés par virgules ; une POSITION VIDE (double virgule) SAUTE le moteur correspondant : `search go 0,5,8,9 Magog` → google→0, paulgo→5, startpage→8, ddg→9 ; `search go 0,,8,9 Magog` → paulgo sauté. La requête est TOUJOURS en dernier argument |
+| **`ffsr screen <N> <dossier/`** | écrit TOUJOURS un fichier WebP dans le dossier donné ; nom généré : `tab<N>_<AAAA-MM-JJ>_<HHhMM>.webp` (ex. `tab0_2026-08-11_14h32.webp`) ; imprime le chemin complet du fichier écrit sur stdout |
+| **`ffsr f5 <N>`** | **HARD reload TOUJOURS** : `browsingContext.reload { context, cache:"bypass", wait:"complete" }` — jamais de cache préservé (équivalent Ctrl+Shift+R). Validé sur le pont : reload bypass OK, compteur réseau repart de zéro |
+| **`ffsr get <N>`** | HTML complet de l'onglet (`document.documentElement.outerHTML`) — la base. Lecture seule, rétroactif |
+| **`ffsr get child <N>`** | HTML des ENFANTS/iframes (getTree → sous-contextes → leur outerHTML). Le HTML parent montre les iframes mais pas leur contenu — c'est le correctif |
+| **`ffsr get txt <N>`** | TEXTE VISIBLE (`document.body.innerText`) — l'équivalent ctrl+A : tout le texte RENDU, sans balises. Lecture seule |
+| **`ffsr get net <N>`** | INSTANTANÉ réseau (PAS un stream, décision 2026-08-11) : `performance.getEntriesByType('resource')` (url, type, durée) — rétroactif, validé (98 ressources sur google). Le LLM pourra demander un vrai stream network.* plus tard si besoin |
+| **`ffsr get con <N>``** | STREAM console (SEUL stream de v1) : s'abonne à `log.entryAdded` (validé : émet en direct) → `f5`/reload → **imprime chaque entrée au fil de l'eau** sur stdout → s'arrête au **Ctrl+C** du client |
+| ~~`ffsr close <N>`~~ | **SUPPRIMÉ** : les 10 onglets sont permanents, jamais fermés. Vider un onglet = `open about:blank [N]` (même mécanisme que toute navigation) |
+
 ## Règles d'or
 
-- Sessions BiDi atomiques : `session.new` → action → `session.end` TOUJOURS exécuté.
+- La session appartient AU DAEMON : lui seul fait `session.new` (au start)
+  et `session.end` (au stop propre). Les CLI ne font JAMAIS de session.
+- **`session.end` exécuté TOUJOURS avant la mort du daemon** (SIGINT/SIGTERM
+  → session.end → sortie propre ; goto cleanup en erreur). JAMAIS de mort
+  sans libérer la session (sinon session zombie qui bloque le pont).
+- **JAMAIS de fermeture explicite de connexion (`ws.close()`)** : `session.end`
+  est le SEUL geste de fin — la mort naturelle du processus ferme le socket,
+  Firefox s'en charge. (Établi avec Éric, 2026-08-11.)
+- **Persistance idle prouvée (2026-08-11)** : 60 s de silence total testées —
+  la connexion reste ouverte et la session répond ; aucun timeout d'inactivité
+  dans le code source (WebSocketTransport/httpd.js n'ont aucun idle timeout).
+  L'architecture « possesseur silencieux » est donc viable sans keepalive.
+- **Un zombie (connexion morte sans `session.end`) est définitif** : la session
+  ne se libère jamais d'elle-même (500 essais sur 150 s — lock_timer). Seul le
+  redémarrage de Firefox purifie (c'est normal et documenté). La session est un
+  bien précieux : ne JAMAIS perdre sa connexion.
+- **`session.status` = la SONDE (2026-08-11, validée)** : `ready:true` → pont
+  libre, on peut `session.new` ; `ready:false` + `"Session already started"` →
+  session existante (orpheline ou daemon étranger) → ne PAS créer, investiguer.
+  Ne JAMAIS sonder avec `session.new` (ça crée ce qu'on inspecte).
 - open/close appariés : chaque fenêtre créée est fermée ; l'onglet 0 est
   réinitialisé (`about:blank`), jamais fermé ; les onglets 1-9 se ferment
   individuellement sans toucher à la fenêtre.
 - Sortie stdout = données brutes/JSON ; stderr = humain ; exit 0/1/2.
-- Timeout global 30 s par commande ; loopback `127.0.0.1:9222` codé en dur.
+- Timeout global 30 s par commande (côté daemon pour les actions, côté CLI
+  pour l'attente de réponse) ; loopback `127.0.0.1:9222` codé en dur.
 
 ## Installation et usage (contrat de privilèges)
 
-- **Binaire SYSTEMWIDE** : installé dans `/usr/local/bin/ffsr` (une fois,
-  `sudo make install` — comme `curl` ou `ping`).
+- **Binaires SYSTEMWIDE** : installés dans `/usr/local/bin/` — `ffsr` (CLI)
+  et `ffsrd` (daemon) — une fois, `sudo make install` (comme `curl`/`ping`).
 - **Usage indifférent au privilège** : ffsr fonctionne **avec OU sans sudo**,
   comme `curl`/`ping`. Aucune exigence de préférence — l'outil est appelable
   depuis n'importe quel context (utilisateur, root, script cron, IA).
-- **État par-utilisateur** : `~/.local/state/ffsr/state` est résolu **selon
-  l'utilisateur qui invoque** (root → `/root/.local/...`, eric →
-  `/home/eric/.local/...`). Chaque context a son propre état, c'est volontaire
-  et sain : ffsr ne mélange jamais les états entre utilisateurs.
-- Conséquence : la fenêtre dédiée/les onglets pilotés par un contexte donné
-  appartiennent à ce context ; un `ffsr ping` répond « OK » quel que soit
-  l'appelant (le root n'est jamais requis pour le runtime).
+- **Tout est système, rien n'est par-utilisateur** (validé 2026-08-11) : le
+  daemon est root et la session Firefox est UNIQUE → l'état est unique.
+  Jamais de `~`, de `$HOME`, de `getpwuid` : aucune résolution de home —
+  on ne touche pas aux homes des utilisateurs, point.
+- **Socket** : `/run/ffsrd/ffsr.sock` (système).
+  **Propriété du socket** : du point de vue de ffsrd, se connecter au WS =
+  dialoguer avec un AUTRE PID (le bout serveur `firefox-bin` de la connexion
+  9222, lisible dans `ss -tnp`) → le possesseur du WS est donc `firefox-bin`.
+  Règle : ffsrd détecte l'UID de ce PID et **chown le socket sur CET
+  utilisateur + groupe `sudo`**, mode 0660. Root n'a pas besoin d'être ajouté
+  (le daemon root crée le socket ; root accède à tout, de toute façon).
+  Machine de référence : uid 1000 (eric) + `sudo` (eric, claude). Jamais de
+  dépendance à un groupe « tous les utilisateurs » (inexistant : `users` vide
+  sur Debian, peuplé sur Slackware — comportement variable, refusé).
+- **État** : `/var/lib/ffsrd/state` — unique, système, écrit par le daemon.
+- Conséquence : la fenêtre dédiée/les onglets sont gérés par le daemon root,
+  pour son unique session ; n'importe quel appelant (eric, sudo, cron, IA)
+  qui parle au socket voit le MÊME état — un `ffsr d status` répond « OK »
+  quel que soit l'appelant (le root n'est jamais requis pour le runtime du CLI).
 - Prérequis build : `gcc`, `libcurl4-openssl-dev` (debian).
