@@ -44,6 +44,9 @@
 typedef struct {
   int   fd;          /* -1 = free */
   Buf   in;          /* read buffer (incoming frames) */
+  int   stream;      /* 1 = streaming client (session.subscribe): the
+                      * connection stays open and WS events are relayed */
+  time_t last_seen;  /* last activity (session timeout, 10 min) */
 } Client;
 
 typedef struct {
@@ -86,6 +89,8 @@ static void client_close_slot(int slot) {
       if (clients[i].fd > g_maxfd) g_maxfd = clients[i].fd;
   }
   clients[slot].fd = -1;
+  clients[slot].stream = 0;
+  clients[slot].last_seen = 0;
   buf_reset(&clients[slot].in);
   /* Purge the pending of this client: a response arriving late (slow
    * iframe, etc.) after its disconnect must NEVER be routed to the
@@ -453,6 +458,12 @@ static int ws_connect_firefox(void) {
 /* Takes a client's complete frame, rewrites the id, puts it on the WS. */
 static void client_to_ws(int slot) {
   Client *c = &clients[slot];
+  /* Streaming client (get con): session.subscribe marks the connection
+   * so that the daemon keeps it open and relays WS events to it. */
+  if (strstr(c->in.data, "\"method\":\"session.subscribe\"")) {
+    c->stream = 1;
+    log_msg("client #%d: streaming mode (session.subscribe)", slot);
+  }
   long id_client = 0;
   if (json_get(c->in.data, c->in.len, "id", NULL, &id_client) == JSON_NOTFOUND) {
     log_msg("client #%d: frame without id, relayed as-is", slot);
@@ -496,7 +507,22 @@ static void relay_message(const char *data, size_t len) {
   long id_global = 0;
   JsonVal jv = json_get(data, len, "id", NULL, &id_global);
   if (jv == JSON_NOTFOUND) {
-    log_msg("ws: message without id (event), ignored");
+    /* WS event (no id): relay to the streaming clients (get con), or
+     * ignore (the historical behaviour — one request/response per
+     * connection, events were noise). */
+    int relayed = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (clients[i].fd >= 0 && clients[i].stream) {
+        log_msg("TRC event: %zu octets vers fd %d — %.60s", len,
+                clients[i].fd, data);
+        if (write_all(clients[i].fd, data, len) != 0)
+          log_msg("client fd %d: write failed", clients[i].fd);
+        clients[i].last_seen = time(NULL);
+        relayed = 1;
+      }
+    }
+    if (!relayed)
+      log_msg("ws: message without id (event), ignored");
     return;
   }
   for (int i = 0; i < MAX_PENDING; i++) {
@@ -515,15 +541,22 @@ static void relay_message(const char *data, size_t len) {
                 tl, fd, t);
         if (write_all(fd, t, tl) != 0)
           log_msg("client fd %d: write failed", fd);
+        for (int c = 0; c < MAX_CLIENTS; c++)
+          if (clients[c].fd == fd) clients[c].last_seen = time(NULL);
         free(t);
       } else {
         /* no id in the response: relayed as-is */
         if (write_all(fd, data, len) != 0)
           log_msg("client fd %d: write failed", fd);
       }
-      /* flight 2 convention: one response per connection → close */
+      /* flight 2 convention: one response per connection → close,
+       * EXCEPT for streaming clients (get con): the connection stays
+       * open and WS events keep flowing to them. */
       for (int c = 0; c < MAX_CLIENTS; c++) {
-        if (clients[c].fd == fd) { client_close_slot(c); break; }
+        if (clients[c].fd == fd && !clients[c].stream) {
+          client_close_slot(c);
+          break;
+        }
       }
       log_msg("response routed to fd %d (id %ld)", fd, id_client);
       return;
@@ -952,6 +985,7 @@ int main(int argc, char **argv) {
 
   for (int i = 0; i < MAX_CLIENTS; i++) {
     clients[i].fd = -1;
+    clients[i].stream = 0;
     buf_init(&clients[i].in);
   }
   for (int i = 0; i < MAX_PENDING; i++) pending[i].used = 0;
@@ -995,10 +1029,22 @@ int main(int argc, char **argv) {
 
   while (!g_stop) {
     rfds = g_rd;
-    if (select(g_maxfd + 1, &rfds, NULL, NULL, NULL) < 0) {
+    /* 1 s timeout: lets us reap idle clients (session limit 10 min) */
+    struct timeval tv = { 1, 0 };
+    if (select(g_maxfd + 1, &rfds, NULL, NULL, &tv) < 0) {
       if (errno == EINTR) continue;
       log_err("select: %s", strerror(errno));
       break;
+    }
+
+    /* Session timeout (decision 2026-08-12): no client stays connected
+     * doing nothing (streams included) — close after 10 min of silence. */
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (clients[i].fd >= 0 && now - clients[i].last_seen > 600) {
+        log_msg("client #%d: session timeout (10 min), closing", i);
+        client_close_slot(i);
+      }
     }
 
     if (FD_ISSET(g_wsfd, &rfds)) ws_to_clients();
@@ -1022,6 +1068,7 @@ int main(int argc, char **argv) {
           close(cfd);
         } else {
           clients[slot].fd = cfd;
+          clients[slot].last_seen = time(NULL);
           buf_reset(&clients[slot].in);
           if (cfd > g_maxfd) g_maxfd = cfd;
           FD_SET(cfd, &g_rd);
@@ -1042,6 +1089,7 @@ int main(int argc, char **argv) {
       }
 
       buf_append(&clients[i].in, tmp, (size_t)n);
+      clients[i].last_seen = time(NULL);
       /* Flight 2 convention: ONE request per connection → once we have
        * read something and the client stops writing (drain), we relay.
        * Simplification: relay when the read did not fill the COMPLETE

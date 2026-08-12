@@ -766,10 +766,91 @@ static int cmd_get_file(int n, int want_wait, int src) {
   return EXIT_OK;
 }
 
-/* ffsr get [html|txt|net|child|file] <N> [w] [-src] — LE socle groupé des
- * extractions (HTML, texte visible, instantané réseau = la même mécanique,
- * seule l'expression change ; child = boucle des iframes ; file = canal
- * binaire blob/source). Sortie BRUTE. */
+/* ------------------------------------------------------- get con */
+
+/* Mini-parseur JSON : sépare les trames du flux du stream (string-aware :
+ * les accolades à l'intérieur des chaînes ne comptent pas). Imprime
+ * chaque log.entryAdded sur stdout. Retourne à EOF (daemon fermé). */
+static void stream_loop(int fd) {
+  char tmp[16384];
+  Buf acc;
+  buf_init(&acc);
+  int depth = 0;
+  int in_str = 0, esc = 0;
+  for (;;) {
+    ssize_t n = read(fd, tmp, sizeof(tmp));
+    if (n <= 0) return;
+    for (ssize_t i = 0; i < n; i++) {
+      char ch = tmp[i];
+      buf_append(&acc, &ch, 1);
+      if (in_str) {
+        if (esc) esc = 0;
+        else if (ch == '\\') esc = 1;
+        else if (ch == '"') in_str = 0;
+        continue;
+      }
+      if (ch == '"') { in_str = 1; continue; }
+      if (ch == '{') depth++;
+      else if (ch == '}') {
+        depth--;
+        if (depth == 0) {
+          if (strstr(acc.data, "\"method\":\"log.entryAdded\"")) {
+            fwrite(acc.data, 1, acc.len, stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
+          }
+          buf_reset(&acc);
+        }
+      }
+    }
+  }
+}
+
+/* ffsr get con <N> — STREAM console (SEUL stream de v1) : s'abonne à
+ * log.entryAdded sur le contexte de l'onglet N (session.subscribe, la
+ * connexion reste ouverte côté daemon) et imprime chaque entrée au fil
+ * de l'eau sur stdout. S'arrête au Ctrl+C (SIGINT tue le processus,
+ * le daemon libère le slot). */
+static int cmd_get_con(int n) {
+  char cw[64];
+  char ctxs[64][64];
+  char urls[64][2048];
+  int count = resolve_dedicated(cw, ctxs, urls);
+  if (count == 0) {
+    log_err("dedicated window not found — no tabs?");
+    return EXIT_ERR;
+  }
+  if (n >= count) {
+    log_err("tab %d out of range: dedicated window has %d tab(s)", n, count);
+    return EXIT_BADARGS;
+  }
+  int fd = tunnel_connect();
+  if (fd < 0) {
+    log_err("ffsrd unreachable (%s) — is it running? (ffsr d status)",
+            strerror(errno));
+    return EXIT_ERR;
+  }
+  char trame[2048];
+  snprintf(trame, sizeof(trame),
+           "{\"id\":7,\"method\":\"session.subscribe\",\"params\":{"
+           "\"events\":[\"log.entryAdded\"],\"contexts\":[\"%.63s\"]}}",
+           ctxs[n]);
+  if (write_all(fd, trame, strlen(trame)) != 0) {
+    log_err("tunnel write: %s", strerror(errno));
+    close(fd);
+    return EXIT_ERR;
+  }
+  fprintf(stderr, "(get con %d: streaming console — Ctrl+C to stop)\n", n);
+  stream_loop(fd);
+  close(fd);
+  return EXIT_OK;
+}
+
+/* ffsr get [html|txt|net|child|file|con] <N> [w] [-src] — LE socle groupé
+ * des extractions (HTML, texte visible, instantané réseau = la même
+ * mécanique, seule l'expression change ; child = boucle des iframes ;
+ * file = canal binaire blob/source ; con = stream console). Sortie
+ * BRUTE. */
 static int cmd_get(const char *type, int n, int want_wait) {
   char cw[64];
   char ctxs[64][64];
@@ -844,6 +925,7 @@ static int show_usage(void) {
          "  ffsr get file <N 0-9> [w]  | binary channel: rendered DOM of tab N\n"
          "                             |   (no 'w': click + immediate return, LLM polls)\n"
          "  ffsr get file <N 0-9> -src [w] | raw source of tab N's URL (mp4, images...)\n"
+         "  ffsr get con <N 0-9>       | console stream (log.entryAdded, Ctrl+C)\n"
          "  ffsr <json-bidi-frame>     | send the raw BiDi frame via the tunnel\n"
          "  ffsr d status              | service status (systemctl)\n"
          "  ffsr d start               | systemctl start ffsrd.service\n"
@@ -953,8 +1035,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(type, "html") != 0 && strcmp(type, "txt") != 0 &&
         strcmp(type, "net") != 0 && strcmp(type, "child") != 0 &&
-        strcmp(type, "file") != 0) {
-      log_err("unknown get type '%s' (expected: html|txt|net|child|file)", type);
+        strcmp(type, "file") != 0 && strcmp(type, "con") != 0) {
+      log_err("unknown get type '%s' (expected: html|txt|net|child|file|con)",
+              type);
       return EXIT_BADARGS;
     }
     if (src && strcmp(type, "file") != 0) {
@@ -968,6 +1051,7 @@ int main(int argc, char **argv) {
       return EXIT_BADARGS;
     }
     if (strcmp(type, "file") == 0) return cmd_get_file((int)n, want_wait, src);
+    if (strcmp(type, "con") == 0) return cmd_get_con((int)n);
     return cmd_get(type, (int)n, want_wait);
   }
 
