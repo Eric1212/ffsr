@@ -1,0 +1,30 @@
+[Unit]
+Description=ffsrd — FireFox Simple Relay daemon (WS bridge to 9222)
+Documentation=man:ffsr(1)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ffsrd
+Environment=FFSRD_TARGET_UID=1000
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (calqué sur ram-reclaim.service de la machine de référence)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ReadWritePaths=/run/ffsrd /var/lib/ffsrd
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

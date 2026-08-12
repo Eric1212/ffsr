@@ -103,13 +103,24 @@ Firefox (9222) ◄──WS unique── ffsrd (passthrough pur, détient la sess
   Reçoit les demandes JSON des CLI → les transfère TELLES QUELLES sur le WS ;
   route les réponses par `id` (multiplexage validé : plusieurs demandes
   simultanées dans la même session).
+- **Multiplexage jusqu'à 128 clients simultanés** (chiffre final validé
+  2026-08-11 — au départ 1000, recalibré : le cas réel est UN opérateur
+  (LLM unique) avec quelques commandes en vol par onglet, 10 onglets × 5 +
+  marge = 64, 128 = marge large safe. Table fixe, pas d'allocation
+  dynamique) :
+  le daemon est le seul canal vers le WS unique → il réécrit le champ `id`
+  de chaque trame entrante (id client → id global unique) et route chaque
+  réponse au bon fd via sa table `id_global → fd`. Sans réécriture, les
+  ids 1,2,3… de deux clients se croiseraient sur le WS. C'est le SEUL
+  champ qu'il parse — le reste de la trame passe tel quel (passthrough).
 - Ouvre `ws://127.0.0.1:9222/session` et crée la session UNE seule fois, au
   démarrage. Il vit en silence ensuite (persistance idle prouvée : aucun
   timeout serveur).
 - Seule intelligence : la VIE de la session. Jamais de mort sans rendre :
-  SIGINT/SIGTERM → `session.end` → sortie propre. Crash → le CLI relance un
-  ffsrd frais ; si le pont est verrouillé par un zombie (connexion morte sans
-  `session.end`), c'est le redémarrage Firefox qui purge (documenté).
+  SIGINT/SIGTERM → `session.end` → sortie propre. Crash → **systemd
+  (`Restart=on-failure`) relance un ffsrd frais** ; si le pont est verrouillé
+  par un zombie (connexion morte sans `session.end`), c'est le redémarrage
+  Firefox qui purge (documenté).
 - **Sa complexité est dans l'installation** (validé Éric) : unit systemd
   système (calquée sur `ram-reclaim.service` de la machine de référence :
   `Type=simple`, `ExecStart=/usr/bin/ffsrd /etc/ffsrd/config`, `Restart=on-failure`
