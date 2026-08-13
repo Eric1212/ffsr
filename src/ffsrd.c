@@ -36,7 +36,7 @@
 #define WINDOW_SOCK     "/run/ffsrd/window.sock"   /* dedicated window hash */
 #define SOCK_MODE       0660             /* rw: owner + sudo group */
 #define WS_URL          "ws://127.0.0.1:9222/session"
-#define HANDSHAKE_TO    5000             /* ms startup response wait */
+#define HANDSHAKE_TO    10000            /* ms startup/shutdown response wait */
 #define LOG_PATH        "/var/lib/ffsrd/ffsrd.log"
 
 /* ------------------------------------------------------- routing table */
@@ -606,7 +606,7 @@ static void shutdown_daemon(int code) {
     /* Wait for Firefox to actually process session.end (not just send it).
      * Without this, the session stays locked and the next ffsrd gets
      * "Maximum number of active sessions". */
-    const char *rep = ws_wait_daemon_response(2000);
+    const char *rep = ws_wait_daemon_response(10000);
     if (rep && strstr(rep, "\"type\":\"success\"") == NULL)
       log_msg("session.end response: %s", rep);
     free((void *)rep);
