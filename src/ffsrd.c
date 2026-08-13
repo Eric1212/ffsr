@@ -697,7 +697,7 @@ static void state_save(void) {
 static char *bidi_call_timeout(const char *method, const char *params_json,
                                int timeout_ms);
 static char *bidi_call(const char *method, const char *params_json) {
-  return bidi_call_timeout(method, params_json, 5000);
+  return bidi_call_timeout(method, params_json, 10000);
 }
 static char *bidi_call_timeout(const char *method, const char *params_json,
                                int timeout_ms) {
