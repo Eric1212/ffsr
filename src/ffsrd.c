@@ -336,7 +336,7 @@ static const char *ws_wait_daemon_response(int timeout_ms) {
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
     if (tv.tv_sec == 0 && tv.tv_usec == 0) {
-      tv.tv_sec = 1;
+      tv.tv_sec = 10;
       tv.tv_usec = 0;
     }
     /* partial message already received → give extra time to arrive
@@ -615,7 +615,7 @@ static void shutdown_daemon(int code) {
      * NB: this is NOT the forbidden ws.close (never WITHOUT session.end). */
     size_t sent = 0;
     curl_ws_send(g_curl, NULL, 0, &sent, 0, CURLWS_CLOSE);
-    usleep(50000);
+    sleep(10);
     g_ws_alive = 0;
   }
   for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -833,7 +833,7 @@ static int dedicated_window_ensure(void) {
   int ok = 0;
   int nalive = 0;
   for (int attempt = 0; attempt < 3 && !ok; attempt++) {
-    if (attempt > 0) usleep(500000);   /* 500 ms between attempts */
+    if (attempt > 0) sleep(10);   /* 10 s between attempts */
     char *rep = bidi_call("browsingContext.getTree", "{\"maxDepth\":0}");
     if (!rep) {
       log_err("reconciliation: getTree without response (attempt %d/3)",
@@ -1032,8 +1032,8 @@ int main(int argc, char **argv) {
 
   while (!g_stop) {
     rfds = g_rd;
-    /* 1 s timeout: lets us reap idle clients (session limit 10 min) */
-    struct timeval tv = { 1, 0 };
+    /* 10 s timeout: lets us reap idle clients (session limit 10 min) */
+    struct timeval tv = { 10, 0 };
     if (select(g_maxfd + 1, &rfds, NULL, NULL, &tv) < 0) {
       if (errno == EINTR) continue;
       log_err("select: %s", strerror(errno));
