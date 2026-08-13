@@ -1009,9 +1009,8 @@ int main(int argc, char **argv) {
 
   /* the session BEFORE listening: the daemon must be the owner */
   if (ws_connect_firefox() != 0) {
-    log_err("WS link failed — ffsrd will not start (bridge down?)");
-    /* If the WS is connected (g_ws_alive), session.end will be tried:
-     * no session created without being returned. */
+    /* ws_connect_firefox() already logged the specific error (zombie,
+     * bridge down, etc.). Just shutdown cleanly. */
     shutdown_daemon(EXIT_ERR);
   }
 
