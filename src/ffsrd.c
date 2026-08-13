@@ -378,7 +378,6 @@ static const char *ws_wait_daemon_response(int timeout_ms) {
 }
 
 /* WS connection + session creation (the absolute prerequisite). */
-static char *bidi_call(const char *method, const char *params_json);
 static int ws_connect_firefox(void) {
   g_curl = curl_easy_init();
   if (!g_curl) { log_err("curl_easy_init"); return -1; }
@@ -403,55 +402,22 @@ static int ws_connect_firefox(void) {
   g_ws_alive = 1;   /* from here on: every error path must return the session */
   log_msg("WS connected to %s (fd %d)", WS_URL, g_wsfd);
 
-  /* Probe: session.status — never creating */
-  if (ws_command("session.status", "{}") != 0) return -1;
-  const char *rep = ws_wait_daemon_response(HANDSHAKE_TO);
-  if (!rep) { log_err("no session.status response"); return -1; }
-  bool ready = strstr(rep, "\"ready\":true") != NULL;
-  log_msg("session.status → ready:%s", ready ? "true" : "FALSE");
-  if (!ready) {
-    /* existing session (zombie or other): verify health before deciding.
-     * A zombie session still answers session.status but fails real commands.
-     * We test with browsingContext.getTree which requires an active session. */
-    log_msg("session already active — verifying health...");
-    free((void *)rep);
-    char *verify = bidi_call("browsingContext.getTree", "{\"maxDepth\":0}");
-    if (!verify) {
-      log_err("no verification response — assuming zombie");
-      /* fall through to session.new */
-    } else {
-      bool invalid = strstr(verify, "\"error\":\"invalid session id\"") != NULL;
-      free(verify);
-      if (!invalid) {
-        log_msg("session already active — ffsrd relays without creating (bridge busy)");
-        return 0;
-      }
-      log_msg("session is invalid (zombie) — recreating");
-    }
-  } else {
-    free((void *)rep);
-  }
-
   /* The only creation: session.new */
   if (ws_command("session.new", "{\"capabilities\":{}}") != 0) return -1;
-  rep = ws_wait_daemon_response(HANDSHAKE_TO);
-  if (rep) {
-    const char *sid = NULL;
-    if (json_get(rep, strlen(rep), "sessionId", &sid, NULL) == JSON_STR) {
-      log_msg("session created: %.8s…", sid);
-    } else if (strstr(rep, "\"error\":\"session not created\"") &&
-               strstr(rep, "Maximum number of active sessions")) {
-      log_err("zombie session still locked — reboot Firefox");
-      free((void *)rep);
-      return -1;
-    } else {
-      log_msg("session.new response: %s", rep);
-    }
+  const char *rep = ws_wait_daemon_response(HANDSHAKE_TO);
+  if (!rep) { log_err("no session.new response"); return -1; }
+  const char *sid = NULL;
+  if (json_get(rep, strlen(rep), "sessionId", &sid, NULL) == JSON_STR) {
+    log_msg("session created: %.8s…", sid);
+  } else if (strstr(rep, "\"error\":\"session not created\"") &&
+             strstr(rep, "Maximum number of active sessions")) {
+    log_err("zombie session still locked — reboot Firefox");
     free((void *)rep);
-  } else {
-    log_err("no session.new response");
     return -1;
+  } else {
+    log_msg("session.new response: %s", rep);
   }
+  free((void *)rep);
 
   /* get-file channel (2026-08-12) : Firefox writes the downloaded blobs
    * here — the CLI reads them, serves them on stdout, then purges them. */
