@@ -603,10 +603,13 @@ static void shutdown_daemon(int code) {
   if (g_ws_alive && g_curl) {
     log_msg("shutdown — session.end");
     ws_command("session.end", "{}");
-    /* let the frame leave before dying (synchronous write, but we wait
-     * a short moment so Firefox processes it) */
-    struct timeval tv = { 0, 300000 };
-    select(0, NULL, NULL, NULL, &tv);
+    /* Wait for Firefox to actually process session.end (not just send it).
+     * Without this, the session stays locked and the next ffsrd gets
+     * "Maximum number of active sessions". */
+    const char *rep = ws_wait_daemon_response(2000);
+    if (rep && strstr(rep, "\"type\":\"success\"") == NULL)
+      log_msg("session.end response: %s", rep);
+    free((void *)rep);
     /* WS protocol CLOSE frame: clean closure (code 1000) — without it,
      * Firefox sees an abnormal closure (1006).
      * NB: this is NOT the forbidden ws.close (never WITHOUT session.end). */
