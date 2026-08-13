@@ -387,8 +387,11 @@ static int cmd_go(int n, const char *url, int want_wait) {
     target = fixed;
   }
 
-  return navigate_ctx(ctxs[n], target, want_wait ? "interactive" : "none",
-                      want_wait ? 60 : 10);
+  int rc = navigate_ctx(ctxs[n], target, want_wait ? "interactive" : "none",
+                       want_wait ? 60 : 10);
+  if (rc == EXIT_OK)
+    fprintf(stderr, "Job done, check ffsr tabs.\n");
+  return rc;
 }
 
 /* ffsr search — PURE list of the accepted engines, by preference order.
@@ -464,7 +467,12 @@ static int cmd_search_go(const char *tabs_list, const char *query) {
     log_err("too many positions: 4 engines max");
     return EXIT_BADARGS;
   }
-  return err ? EXIT_ERR : EXIT_OK;
+  if (err) {
+    log_err("some navigations failed");
+    return EXIT_ERR;
+  }
+  fprintf(stderr, "Job done, check ffsr tabs.\n");
+  return EXIT_OK;
 }
 
 /* ffsr f5 <N> [w] — HARD reload ALWAYS (cache:bypass, Ctrl+Shift+R
