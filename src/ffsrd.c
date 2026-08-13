@@ -720,27 +720,6 @@ static int get_result_str(const char *doc, const char *key,
   return 0;
 }
 
-/* Lists the top-level contextIds of the getTree (max max items). */
-static int get_context_list(const char *doc, char list[][64], int max) {
-  size_t rs = 0, re = 0, cs = 0, ce = 0;
-  if (json_value_bounds(doc, strlen(doc), "result", &rs, &re) != 1) return 0;
-  if (json_value_bounds(doc + rs, re - rs, "contexts", &cs, &ce) != 1) return 0;
-  const char *arr = doc + rs + cs;
-  size_t alen = ce - cs;
-  size_t pos = 1, s = 0, e = 0;
-  int n = 0;
-  while (n < max && json_array_next(arr, alen, &pos, &s, &e) > 0) {
-    size_t vs = 0, ve = 0;
-    if (json_get_str_bounds(arr + s, e - s, "context", &vs, &ve) == JSON_STR) {
-      size_t l = ve - vs < 63 ? ve - vs : 63;
-      memcpy(list[n], arr + s + vs, l);
-      list[n][l] = '\0';
-      n++;
-    }
-  }
-  return n;
-}
-
 /* ----------------------------------- dedicated window (prerequisite #1) */
 
 /* Creates THE visible dedicated window + the 9 tabs (full 0-9 matrix,
@@ -830,107 +809,73 @@ static int dedicated_window_create(void) {
 static int dedicated_window_ensure(void) {
   state_load();
 
-  int ok = 0;
-  int nalive = 0;
-  for (int attempt = 0; attempt < 3 && !ok; attempt++) {
-    if (attempt > 0) sleep(10);   /* 10 s between attempts */
+  /* Firefox exposes different contextIds on every new BiDi session, so
+   * comparing the saved state matrix against live contexts is pointless.
+   * The only reliable signal is structural: a window with exactly MAX_TABS
+   * tabs is the dedicated window. Try up to 3 times, then create. */
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) sleep(10);
     char *rep = bidi_call("browsingContext.getTree", "{\"maxDepth\":0}");
     if (!rep) {
       log_err("reconciliation: getTree without response (attempt %d/3)",
               attempt + 1);
       continue;
     }
-    char alive[64][64];
-    nalive = get_context_list(rep, alive, 64);
-    if (nalive < 10)
-      log_msg("reconciliation: %d visible contexts (attempt %d/3) — response: %.*s",
-              nalive, attempt + 1, (int)(strlen(rep) > 300 ? 300 : strlen(rep)),
-              rep);
-    free(rep);
-
-    ok = g_nbtabs == MAX_TABS && g_tabs[0][0];
-    for (int i = 0; ok && i < MAX_TABS; i++) {
-      int found = 0;
-      for (int j = 0; j < nalive; j++)
-        if (strcmp(g_tabs[i], alive[j]) == 0) { found = 1; break; }
-      if (!found) ok = 0;
+    size_t rs = 0, re = 0, cs = 0, ce = 0;
+    if (json_value_bounds(rep, strlen(rep), "result", &rs, &re) != 1
+        || json_value_bounds(rep + rs, re - rs, "contexts", &cs, &ce) != 1) {
+      log_msg("reconciliation: unexpected getTree shape (attempt %d/3)", attempt + 1);
+      free(rep);
+      continue;
     }
-    if (!ok && nalive >= 10) {
-      /* contexts exist but not the state's: the window may have been
-       * closed manually — recreate (expected behavior) */
-      log_msg("reconciliation: %d live contexts ≠ state matrix", nalive);
-    }
-  }
-
-  if (ok) {
-    log_msg("dedicated window present (matrix %d/10 healthy, window=%s)",
-            g_nbtabs, g_win_hint);
-    return 0;
-  }
-
-  /* LEVEL 2 — decision 2026-08-12: the daemon NEVER closes windows;
-   * when the state matrix is nowhere to be found, it RESUMES an existing
-   * dedicated window (STRUCTURAL SIGNATURE: exactly MAX_TABS tabs — the
-   * title marker was removed) instead of creating a new one → no window
-   * cascade at every restart. */
-  {
-    /* re-getTree to restart from fresh data */
-    char *rep = bidi_call("browsingContext.getTree", "{\"maxDepth\":0}");
-    if (rep) {
-      size_t rs = 0, re = 0, cs = 0, ce = 0;
-      if (json_value_bounds(rep, strlen(rep), "result", &rs, &re) == 1
-          && json_value_bounds(rep + rs, re - rs, "contexts", &cs, &ce) == 1) {
-        const char *arr = rep + rs + cs;
-        size_t pos = 1, s = 0, e = 0;
-        /* collect: every (contextId, clientWindow) with URL */
-        char c2[512][96], w2[512][96];
-        int n2 = 0;
-        while (n2 < 512 && json_array_next(arr, ce - cs, &pos, &s, &e) > 0) {
-          size_t vs = 0, ve = 0;
-          if (json_get_str_bounds(arr + s, e - s, "context", &vs, &ve)
-                  != JSON_STR) continue;
-          size_t l = ve - vs < 95 ? ve - vs : 95;
-          memcpy(c2[n2], arr + s + vs, l); c2[n2][l] = '\0';
-          w2[n2][0] = '\0';
-          if (json_get_str_bounds(arr + s, e - s, "clientWindow", &vs, &ve)
+    const char *arr = rep + rs + cs;
+    size_t pos = 1, s = 0, e = 0;
+    char c2[512][96], w2[512][96];
+    int n2 = 0;
+    while (n2 < 512 && json_array_next(arr, ce - cs, &pos, &s, &e) > 0) {
+      size_t vs = 0, ve = 0;
+      if (json_get_str_bounds(arr + s, e - s, "context", &vs, &ve)
+              != JSON_STR) continue;
+      size_t l = ve - vs < 95 ? ve - vs : 95;
+      memcpy(c2[n2], arr + s + vs, l); c2[n2][l] = '\0';
+      w2[n2][0] = '\0';
+      if (json_get_str_bounds(arr + s, e - s, "clientWindow", &vs, &ve)
               == JSON_STR) {
-            l = ve - vs < 95 ? ve - vs : 95;
-            memcpy(w2[n2], arr + s + vs, l); w2[n2][l] = '\0';
-          }
-          n2++;
-        }
-        /* for each distinct clientWindow: EXACTLY MAX_TABS tabs? → it
-         * is the dedicated window → resume it */
-        for (int i = 0; i < n2; i++) {
-          if (!w2[i][0]) continue;
-          int dejavu = 0;
-          for (int j = 0; j < i; j++)
-            if (w2[j][0] && strcmp(w2[j], w2[i]) == 0) dejavu = 1;
-          if (dejavu) continue;
-          int nb = 0;
-          for (int k = 0; k < n2; k++)
-            if (w2[k][0] && strcmp(w2[k], w2[i]) == 0) nb++;
-          if (nb != MAX_TABS) continue;
-          /* dedicated window found: adopt it (state updated) */
-          g_nbtabs = 0;
-          snprintf(g_win_hint, sizeof(g_win_hint), "%.63s", w2[i]);
-          for (int k = 0; k < n2 && g_nbtabs < MAX_TABS; k++) {
-            if (w2[k][0] && strcmp(w2[k], w2[i]) == 0) {
-              size_t cl = strlen(c2[k]);
-              if (cl > 63) cl = 63;
-              memcpy(g_tabs[g_nbtabs], c2[k], cl);
-              g_tabs[g_nbtabs][cl] = '\0';
-              g_nbtabs++;
-            }
-          }
-          state_save();
-          log_msg("dedicated window RESUMED (matrix %d/10, window=%s)",
-                  g_nbtabs, g_win_hint);
-          return 0;
+        l = ve - vs < 95 ? ve - vs : 95;
+        memcpy(w2[n2], arr + s + vs, l); w2[n2][l] = '\0';
+      }
+      n2++;
+    }
+    for (int i = 0; i < n2; i++) {
+      if (!w2[i][0]) continue;
+      int dejavu = 0;
+      for (int j = 0; j < i; j++)
+        if (w2[j][0] && strcmp(w2[j], w2[i]) == 0) dejavu = 1;
+      if (dejavu) continue;
+      int nb = 0;
+      for (int k = 0; k < n2; k++)
+        if (w2[k][0] && strcmp(w2[k], w2[i]) == 0) nb++;
+      if (nb != MAX_TABS) continue;
+      g_nbtabs = 0;
+      snprintf(g_win_hint, sizeof(g_win_hint), "%.63s", w2[i]);
+      for (int k = 0; k < n2 && g_nbtabs < MAX_TABS; k++) {
+        if (w2[k][0] && strcmp(w2[k], w2[i]) == 0) {
+          size_t cl = strlen(c2[k]);
+          if (cl > 63) cl = 63;
+          memcpy(g_tabs[g_nbtabs], c2[k], cl);
+          g_tabs[g_nbtabs][cl] = '\0';
+          g_nbtabs++;
         }
       }
+      state_save();
+      log_msg("dedicated window RESUMED (matrix %d/10, window=%s)",
+              g_nbtabs, g_win_hint);
       free(rep);
+      return 0;
     }
+    log_msg("reconciliation: %d contexts, no 10-tab window (attempt %d/3)",
+            n2, attempt + 1);
+    free(rep);
   }
 
   log_msg("dedicated window missing or matrix incomplete — creation (nbtabs=%d)",
