@@ -409,44 +409,27 @@ static int ws_connect_firefox(void) {
   g_ws_alive = 1;   /* from here on: every error path must return the session */
   log_msg("WS connected to %s (fd %d)", WS_URL, g_wsfd);
 
-  /* The only creation: session.new — retry up to 3 times if the bridge
-   * reports max sessions (zombie lock). Each retry sends session.end first,
-   * then waits 10s for Firefox to release the slot. */
+  /* The only creation: session.new */
   log_msg("session.new sent");
-  const char *rep = NULL;
-  for (int attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) {
-      log_msg("session.new attempt %d/3: sending session.end to free zombie...", attempt + 1);
-      ws_command("session.end", "{}");
-      const char *end_rep = ws_wait_daemon_response(HANDSHAKE_TO);
-      if (end_rep && strstr(end_rep, "\"type\":\"success\"") == NULL)
-        log_msg("session.end response: %s", end_rep);
-      free((void *)end_rep);
-      log_msg("waiting 10s for Firefox to release the session...");
-      sleep(10);
-    }
-    if (ws_command("session.new", "{\"capabilities\":{}}") != 0) { free((void *)rep); return -1; }
-    rep = ws_wait_daemon_response(HANDSHAKE_TO);
-    if (!rep) { log_err("no session.new response (attempt %d/3)", attempt + 1); continue; }
-    const char *sid = NULL;
-    if (json_get(rep, strlen(rep), "sessionId", &sid, NULL) == JSON_STR) {
-      log_msg("session created: %.8s…", sid);
-      break;
-    } else if (strstr(rep, "\"error\":\"session not created\"") &&
-               strstr(rep, "Maximum number of active sessions")) {
-      log_err("session.new attempt %d/3: zombie session still locked — reboot Firefox", attempt + 1);
-      log_msg("session.new response: %s", rep);
-      free((void *)rep);
-      rep = NULL;
-      continue;
-    } else {
-      log_msg("session.new response: %s", rep);
-      break;
-    }
-  }
-  if (!rep) {
-    log_err("session.new failed after 3 attempts — zombie session still locked, reboot Firefox");
+  if (ws_command("session.new", "{\"capabilities\":{}}") != 0) return -1;
+  const char *rep = ws_wait_daemon_response(HANDSHAKE_TO);
+  if (!rep) { log_err("no session.new response"); return -1; }
+  const char *sid = NULL;
+  if (json_get(rep, strlen(rep), "sessionId", &sid, NULL) == JSON_STR) {
+    log_msg("session created: %.8s…", sid);
+  } else if (strstr(rep, "\"error\":\"session not created\"") &&
+             strstr(rep, "Maximum number of active sessions")) {
+    log_err("zombie session still locked — reboot Firefox");
+    log_msg("session.new response: %s", rep);
+    free((void *)rep);
+    ws_command("session.end", "{}");
+    const char *end_rep = ws_wait_daemon_response(HANDSHAKE_TO);
+    if (end_rep && strstr(end_rep, "\"type\":\"success\"") == NULL)
+      log_msg("session.end response: %s", end_rep);
+    free((void *)end_rep);
     return -1;
+  } else {
+    log_msg("session.new response: %s", rep);
   }
   free((void *)rep);
 
