@@ -439,6 +439,11 @@ static int ws_connect_firefox(void) {
     const char *sid = NULL;
     if (json_get(rep, strlen(rep), "sessionId", &sid, NULL) == JSON_STR) {
       log_msg("session created: %.8s…", sid);
+    } else if (strstr(rep, "\"error\":\"session not created\"") &&
+               strstr(rep, "Maximum number of active sessions")) {
+      log_err("zombie session still locked — reboot Firefox");
+      free((void *)rep);
+      return -1;
     } else {
       log_msg("session.new response: %s", rep);
     }
