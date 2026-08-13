@@ -689,11 +689,17 @@ static void state_save(void) {
 
 /* ------------------------------------------------- daemon-side bidi */
 
-/* Command + response wait (the whole daemon mechanism goes through here).
- * Returns the allocated response (to free) or NULL. */
+/* Command + response wait with default timeout (the whole daemon mechanism
+ * goes through here). Returns the allocated response (to free) or NULL. */
+static char *bidi_call_timeout(const char *method, const char *params_json,
+                               int timeout_ms);
 static char *bidi_call(const char *method, const char *params_json) {
+  return bidi_call_timeout(method, params_json, 5000);
+}
+static char *bidi_call_timeout(const char *method, const char *params_json,
+                               int timeout_ms) {
   if (ws_command(method, params_json) != 0) return NULL;
-  const char *rep = ws_wait_daemon_response(5000);
+  const char *rep = ws_wait_daemon_response(timeout_ms);
   if (!rep) { log_err("bidi_call %s: no response", method); return NULL; }
   return (char *)rep;   /* already allocated by ws_wait_daemon_response */
 }
@@ -738,8 +744,9 @@ static int get_context_list(const char *doc, char list[][64], int max) {
  * all about:blank, fixed order). The daemon is the ONLY creator. */
 static int dedicated_window_create(void) {
   /* the window (tab 0 is born with it — visible by default) */
-  char *rep = bidi_call("browsingContext.create",
-                        "{\"type\":\"window\",\"referenceContext\":null}");
+  char *rep = bidi_call_timeout("browsingContext.create",
+                                "{\"type\":\"window\",\"referenceContext\":null}",
+                                10000);
   if (!rep) return -1;
   if (get_result_str(rep, "context", g_tabs[0], sizeof(g_tabs[0])) != 0) {
     log_err("create window: response without context: %s", rep);
