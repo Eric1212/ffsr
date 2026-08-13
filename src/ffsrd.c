@@ -378,6 +378,7 @@ static const char *ws_wait_daemon_response(int timeout_ms) {
 }
 
 /* WS connection + session creation (the absolute prerequisite). */
+static char *bidi_call(const char *method, const char *params_json);
 static int ws_connect_firefox(void) {
   g_curl = curl_easy_init();
   if (!g_curl) { log_err("curl_easy_init"); return -1; }
@@ -410,25 +411,22 @@ static int ws_connect_firefox(void) {
   log_msg("session.status → ready:%s", ready ? "true" : "FALSE");
   if (!ready) {
     /* existing session (zombie or other): verify health before deciding.
-     * If the session is invalid, we recreate it. */
+     * A zombie session still answers session.status but fails real commands.
+     * We test with browsingContext.getTree which requires an active session. */
     log_msg("session already active — verifying health...");
-    if (ws_command("session.status", "{}") != 0) { free((void *)rep); return -1; }
-    const char *verify = ws_wait_daemon_response(HANDSHAKE_TO);
+    free((void *)rep);
+    char *verify = bidi_call("browsingContext.getTree", "{\"maxDepth\":0}");
     if (!verify) {
-      free((void *)rep);
-      log_err("no verification response");
-      return -1;
-    }
-    bool invalid = strstr(verify, "\"error\":\"invalid session id\"") != NULL;
-    free((void *)verify);
-    if (invalid) {
-      log_msg("session is invalid (zombie) — recreating");
-      free((void *)rep);
+      log_err("no verification response — assuming zombie");
       /* fall through to session.new */
     } else {
-      log_msg("session already active — ffsrd relays without creating (bridge busy)");
-      free((void *)rep);
-      return 0;
+      bool invalid = strstr(verify, "\"error\":\"invalid session id\"") != NULL;
+      free(verify);
+      if (!invalid) {
+        log_msg("session already active — ffsrd relays without creating (bridge busy)");
+        return 0;
+      }
+      log_msg("session is invalid (zombie) — recreating");
     }
   } else {
     free((void *)rep);
