@@ -403,6 +403,7 @@ static int ws_connect_firefox(void) {
   log_msg("WS connected to %s (fd %d)", WS_URL, g_wsfd);
 
   /* The only creation: session.new */
+  log_msg("session.new sent");
   if (ws_command("session.new", "{\"capabilities\":{}}") != 0) return -1;
   const char *rep = ws_wait_daemon_response(HANDSHAKE_TO);
   if (!rep) { log_err("no session.new response"); return -1; }
@@ -412,6 +413,7 @@ static int ws_connect_firefox(void) {
   } else if (strstr(rep, "\"error\":\"session not created\"") &&
              strstr(rep, "Maximum number of active sessions")) {
     log_err("zombie session still locked — reboot Firefox");
+    log_msg("session.new response: %s", rep);
     free((void *)rep);
     return -1;
   } else {
