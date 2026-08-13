@@ -327,17 +327,24 @@ static int ws_command(const char *method, const char *params_json) {
 /* Waits for a WS response destined to the daemon (fd=-1), timeout ms.
  * Returns the (complete) buffer pointer or NULL. */
 static const char *ws_wait_daemon_response(int timeout_ms) {
-  (void)timeout_ms;
   /* Short blocking read: read until the response is found. */
-  struct timeval tv = { 1, 0 };
   fd_set rfds;
   for (;;) {
     FD_ZERO(&rfds);
     FD_SET(g_wsfd, &rfds);
-    /* partial message already received → give the rest time to arrive
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+      tv.tv_sec = 1;
+      tv.tv_usec = 0;
+    }
+    /* partial message already received → give extra time to arrive
      * (fragmented frame) instead of declaring death */
-    tv.tv_sec = g_wsbuf.len ? 10 : 1;
-    tv.tv_usec = 0;
+    if (g_wsbuf.len) {
+      tv.tv_sec = 10;
+      tv.tv_usec = 0;
+    }
     int r = select(g_wsfd + 1, &rfds, NULL, NULL, &tv);
     if (r <= 0) return NULL;
     char buf[8192];
