@@ -409,13 +409,30 @@ static int ws_connect_firefox(void) {
   bool ready = strstr(rep, "\"ready\":true") != NULL;
   log_msg("session.status → ready:%s", ready ? "true" : "FALSE");
   if (!ready) {
-    /* existing session (zombie or other): leave it alone, no creation.
-     * Clients will honestly see Firefox's error responses. */
-    log_msg("session already active — ffsrd relays without creating (bridge busy)");
+    /* existing session (zombie or other): verify health before deciding.
+     * If the session is invalid, we recreate it. */
+    log_msg("session already active — verifying health...");
+    if (ws_command("session.status", "{}") != 0) { free((void *)rep); return -1; }
+    const char *verify = ws_wait_daemon_response(HANDSHAKE_TO);
+    if (!verify) {
+      free((void *)rep);
+      log_err("no verification response");
+      return -1;
+    }
+    bool invalid = strstr(verify, "\"error\":\"invalid session id\"") != NULL;
+    free((void *)verify);
+    if (invalid) {
+      log_msg("session is invalid (zombie) — recreating");
+      free((void *)rep);
+      /* fall through to session.new */
+    } else {
+      log_msg("session already active — ffsrd relays without creating (bridge busy)");
+      free((void *)rep);
+      return 0;
+    }
+  } else {
     free((void *)rep);
-    return 0;
   }
-  free((void *)rep);
 
   /* The only creation: session.new */
   if (ws_command("session.new", "{\"capabilities\":{}}") != 0) return -1;
