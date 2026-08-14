@@ -1093,21 +1093,21 @@ static int show_usage(void) {
            "  The daemon (ffsrd) must be running (see: ffsr d status).\n"
            "\n"
            "REFERENCE\n"
-           "  (no args) / help              Show this help\n"
-           "  tabs                          List the 10 tabs (index, URL, title, size)\n"
-           "  search                        List available search engines and their base URLs\n"
+           "  (no args) / help                Show this help\n"
+           "  tabs                            List the 10 tabs (index, URL, title, size)\n"
+           "  search                          List available search engines and their base URLs\n"
            "\n"
            "NAVIGATION\n"
-           "  go <N> <url> w                Navigate tab N  (w = wait until interactive)\n"
-           "  f5 <N> w                      Hard reload tab N (bypass cache)\n"
-           "  search go <N,N,N,N> <query>   Parallel search (up to 4 engines)\n"
-           "                                Positions:\n"
-           "                                  1 = Google\n"
-           "                                  2 = Paulgo\n"
-           "                                  3 = Startpage\n"
-           "                                  4 = DuckDuckGo\n"
-           "                                Use empty slots to skip an engine.\n"
-           "                                Example:\n"
+           "  go <N> <url> w                  Navigate tab N  (w = wait until interactive)\n"
+           "  f5 <N> w                        Hard reload tab N (bypass cache)\n"
+           "  search go <N,N,N,N> <query>     Parallel search (up to 4 engines)\n"
+           "                                  Positions:\n"
+           "                                    1 = Google\n"
+           "                                    2 = Paulgo\n"
+           "                                    3 = Startpage\n"
+           "                                    4 = DuckDuckGo\n"
+           "                                  Use empty slots to skip an engine.\n"
+           "                                  Example:\n"
            "                                  ffsr search go 0,2,,4 \"firefox bidi\"\n"
            "                                  Google on tab 0, Startpage on tab 2,\n"
            "                                  DuckDuckGo on tab 4 (Paulgo skipped)\n"
@@ -1244,7 +1244,9 @@ int main(int argc, char **argv) {
     const char *type = "html";
     const char *ns = argv[2];
     int want_wait = 0, src = 0, js = 0;
-    if (argc == 4) {
+    if (argc == 3) {
+      /* ffsr get <N> → default to html */
+    } else if (argc == 4) {
       if (strcmp(argv[2], "w") == 0) {
         want_wait = 1;
         ns = argv[3];
