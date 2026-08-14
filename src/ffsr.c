@@ -1065,7 +1065,7 @@ static int show_usage(void) {
            "\n"
            "SYSTEM\n"
            "  d status|start|stop|restart     Control the ffsrd daemon\n"
-           "  <json-bidi-frame>               Raw BiDi frame pass-through\n"
+           "  bidi <json-bidi-frame>          Raw BiDi frame pass-through\n"
            "\n"
            "TYPICAL FLOW\n"
            "  1. ffsr tabs                  ← see what is currently in each tab\n"
@@ -1093,11 +1093,27 @@ int main(int argc, char **argv) {
       strcmp(argv[1], "search") != 0 &&
       strcmp(argv[1], "get") != 0 &&
       strcmp(argv[1], "screen") != 0 &&
-      strcmp(argv[1], "f5") != 0) {
+      strcmp(argv[1], "f5") != 0 &&
+      strcmp(argv[1], "bidi") != 0) {
     return show_usage();
   }
 
-  /* ffsr d … → systemctl (the only commands touching ffsrd) */
+  /* ffsr bidi <frame> — raw BiDi passthrough */
+  if (strcmp(argv[1], "bidi") == 0) {
+    if (argc < 3) {
+      log_err("usage: ffsr bidi <json-frame>");
+      return EXIT_BADARGS;
+    }
+    Buf out;
+    buf_init(&out);
+    int rc = cli_call(argv[2], &out);
+    if (rc == EXIT_OK && out.len > 0) {
+      fwrite(out.data, 1, out.len, stdout);
+      fputc('\n', stdout);
+    }
+    buf_free(&out);
+    return rc;
+  }
   if (strcmp(argv[1], "d") == 0) {
     if (argc < 3) {
       log_err("ffsr d requires a subcommand: status|start|stop|restart");
