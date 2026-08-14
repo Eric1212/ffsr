@@ -65,6 +65,11 @@ static int      g_wsfd = -1;             /* active WS socket (select) */
 static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
+/* keepactive: rotate tab activation every KEEPACTIVE_S seconds */
+#define KEEPACTIVE_S 600
+static int      g_keepactive_idx = 0;
+static time_t   g_keepactive_last = 0;
+
 /* Route a complete WS message to its client (defined below, used by
  * ws_wait_daemon_response BEFORE its definition). */
 static void relay_message(const char *data, size_t len);
@@ -993,6 +998,20 @@ int main(int argc, char **argv) {
         log_msg("client #%d: session timeout (10 min), closing", i);
         client_close_slot(i);
       }
+    }
+
+    /* keepactive: rotate tab activation every KEEPACTIVE_S seconds */
+    if (g_nbtabs > 0 && now - g_keepactive_last > KEEPACTIVE_S) {
+      if (g_keepactive_idx < g_nbtabs && g_tabs[g_keepactive_idx][0]) {
+        char params[160];
+        snprintf(params, sizeof(params),
+                 "{\"context\":\"%.63s\"}", g_tabs[g_keepactive_idx]);
+        ws_command("browsingContext.activate", params);
+        log_msg("keepactive: activated tab %d (%s)",
+                g_keepactive_idx, g_tabs[g_keepactive_idx]);
+      }
+      g_keepactive_idx = (g_keepactive_idx + 1) % MAX_TABS;
+      g_keepactive_last = now;
     }
 
     if (FD_ISSET(g_wsfd, &rfds)) ws_to_clients();
