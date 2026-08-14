@@ -137,8 +137,8 @@ static int window_hash(char *out, size_t sz) {
   }
   Buf b;
   buf_init(&b);
-  if (read_until_eof(fd, &b, 5) != 0) {
-    log_err("window.sock silent (timeout 5 s) — ffsrd busy?");
+  if (read_until_eof(fd, &b, 10) != 0) {
+    log_err("window.sock silent (timeout 10 s) — ffsrd busy?");
     close(fd);
     buf_free(&b);
     return -1;
@@ -358,7 +358,7 @@ static int navigate_ctx(const char *ctx, const char *url, const char *wait,
   return err ? EXIT_ERR : EXIT_OK;
 }
 
-/* ffsr go <N> <url> [w] — navigate tab N of the dedicated window.
+/* ffsr go <N> <url> w — navigate tab N of the dedicated window.
  * Without 'w': wait:none (immediate response, prompt back right away).
  * With 'w': wait:interactive — the prompt comes back only once the DOM
  * is ready (the shell "hangs" during the load).
@@ -475,7 +475,7 @@ static int cmd_search_go(const char *tabs_list, const char *query) {
   return EXIT_OK;
 }
 
-/* ffsr f5 <N> [w] — HARD reload ALWAYS (cache:bypass, Ctrl+Shift+R
+/* ffsr f5 <N> w — HARD reload ALWAYS (cache:bypass, Ctrl+Shift+R
  * equivalent, cache never preserved — CLAUDE.md spec). The 'w' tunes
  * the wait: without 'w' → immediate response; with 'w' → wait for full
  * load. Silent on success. */
@@ -672,6 +672,62 @@ static int src_download(const char *ctx, int n, const char *url) {
   return send_eval_no_wait(ctx, expr);
 }
 
+/* Source download via JS (option A, 2026-08-14): navigate the tab to
+ * about:blank FIRST (a clean context where fetch works — Firefox's native
+ * JSON viewer has an opaque origin and fetch fails there with
+ * NetworkError, observed 2026-08-14), then fetch the CAPTURED url as a
+ * blob and trigger the download. The top-level browsingContext id is
+ * preserved across navigation (BiDi), so the same ctx is reused. CORS
+ * caveat: the fetch is cross-origin from about:blank → the target must
+ * send `access-control-allow-origin: *` (models.dev does; validated). */
+static int src_download_js(const char *ctx, int n, const char *url) {
+  /* Step 1: empty the tab into about:blank to escape the JSON viewer.
+   * A REAL browsingContext.navigate is mandatory: window.location.href
+   * from the JSON viewer keeps an opaque-origin realm where fetch keeps
+   * failing with NetworkError (observed 2026-08-14). */
+  Buf nav;
+  char navt[256];
+  snprintf(navt, sizeof(navt),
+           "{\"id\":3,\"method\":\"browsingContext.navigate\",\"params\":{"
+           "\"context\":\"%.63s\",\"url\":\"about:blank\",\"wait\":\"none\"}}",
+           ctx);
+  buf_init(&nav);
+  if (cli_call(navt, &nav) != EXIT_OK) {
+    buf_free(&nav);
+    return -1;
+  }
+  buf_free(&nav);
+  sleep(10);   /* let the navigation settle */
+
+  /* Step 2: fetch the captured url from the now-blank context. */
+  Buf jurl;
+  buf_init(&jurl);
+  buf_puts(&jurl, "\"");
+  if (json_escape(&jurl, url, strlen(url)) != 0 || buf_puts(&jurl, "\"") != 0) {
+    buf_free(&jurl);
+    return -1;
+  }
+  char expr[1600];
+  snprintf(expr, sizeof(expr),
+           "(()=>{"
+           "const name='ffsr_src%d';"
+           "return fetch(%s).then(r=>{"
+           "  if(!r.ok) throw new Error('HTTP '+r.status);"
+           "  return r.blob();"
+           "}).then(b=>{"
+           "  const a=document.createElement('a');"
+           "  a.href=URL.createObjectURL(b);"
+           "  a.download=name;"
+           "  (document.body||document.documentElement).appendChild(a);"
+           "  a.click();"
+           "  setTimeout(()=>URL.revokeObjectURL(a.href),5000);"
+           "  return 'ok';"
+           "}).catch(e=>{console.error('ffsr_src',e); throw e;});"
+           "})()", n, jurl.data ? jurl.data : "\"\"");
+  buf_free(&jurl);
+  return send_eval_no_wait(ctx, expr);
+}
+
 /* Looks for a staging file (exact name, or prefix if src=1 since MIME type is chosen by Firefox)
  * the MIME type is chosen by Firefox). If present AND stable (2
  * identical stats at 1 s: write complete) : lit, purge, 0. */
@@ -722,10 +778,10 @@ static int wait_staging(const char *name, int src, Buf *out) {
   return -1;
 }
 
-/* ffsr get file <N> [w] [-src]: binary channel. Without w: click + immediate return,
+/* ffsr get file <N> w [src]: binary channel. Without w: click + immediate return,
  * LLM polls to read the file once written
  * With w: click + poll 1×/s → stdout. */
-static int cmd_get_file(int n, int want_wait, int src) {
+static int cmd_get_file(int n, int want_wait, int src, int js) {
   char cw[64];
   char ctxs[64][64];
   char urls[64][2048];
@@ -752,14 +808,16 @@ static int cmd_get_file(int n, int want_wait, int src) {
   }
   buf_free(&out);
 
-  int rc = src ? src_download(ctxs[n], n, urls[n]) : blob_download(ctxs[n], n);
+  int rc = src ? (js ? src_download_js(ctxs[n], n, urls[n])
+                     : src_download(ctxs[n], n, urls[n]))
+              : blob_download(ctxs[n], n);
   if (rc != 0) {
     log_err("get file: download click failed (bridge busy?) — retry");
     return EXIT_ERR;
   }
   if (!want_wait) {
     printf("(download launched — retry `ffsr get file %d%s` in ~5 s)\n", n,
-           src ? " -src" : "");
+           src ? " src" : "");
     return EXIT_OK;
   }
 
@@ -962,7 +1020,7 @@ static int cmd_get_con(int n) {
   return EXIT_OK;
 }
 
-/* ffsr get [html|txt|net|child|file|con] <N> [-src] [w]— Grouped core of extractions
+/* ffsr get [html|txt|net|child|file|con] <N> [src] w— Grouped core of extractions
  * extractions (HTML, visible text, network snapshot = same mechanism,
  * only the expression changes; child = iframe loop;
  * file = binary blob/source stream; con = console stream). RAW output,
@@ -982,7 +1040,7 @@ static int cmd_get(const char *type, int n, int want_wait) {
   }
 
   if (strcmp(type, "child") == 0) return get_child(ctxs[n]);
-  if (strcmp(type, "file") == 0) return cmd_get_file(n, want_wait, 0);
+  if (strcmp(type, "file") == 0) return cmd_get_file(n, want_wait, 0, 0);
 
   const char *expr = NULL;
   if (strcmp(type, "html") == 0)
@@ -1040,8 +1098,8 @@ static int show_usage(void) {
            "  search                        List available search engines and their base URLs\n"
            "\n"
            "NAVIGATION\n"
-           "  go <N> <url> [w]              Navigate tab N  (w = wait until interactive)\n"
-           "  f5 <N> [w]                    Hard reload tab N (bypass cache)\n"
+           "  go <N> <url> w                Navigate tab N  (w = wait until interactive)\n"
+           "  f5 <N> w                      Hard reload tab N (bypass cache)\n"
            "  search go <N,N,N,N> <query>   Parallel search (up to 4 engines)\n"
            "                                Positions:\n"
            "                                  1 = Google\n"
@@ -1057,8 +1115,9 @@ static int show_usage(void) {
            "RETRIEVAL\n"
            "  get <N>                         Full HTML of tab N (outerHTML, binary fallback)\n"
            "  get txt <N>                     Visible text only (innerText)\n"
-           "  get file <N> [w]                Rendered DOM via binary channel (large pages)\n"
-           "  get file <N> -src [w]           Raw source of the tab's current URL (mp4, images…)\n"
+           "  get file <N> w                  Rendered DOM via binary channel (large pages)\n"
+           "  get file <N> src w              Raw source of the tab's current URL (mp4, images…)\n"
+           "  get file <N> src js w           Raw source of the tab's current URL (mp4, images…)\n"
            "  get child <N>                   HTML of iframes / child contexts\n"
            "  get net <N>                     Network resource snapshot\n"
            "  get con <N>                     Live console stream (Ctrl+C to stop)\n"
@@ -1142,12 +1201,12 @@ int main(int argc, char **argv) {
   /* ffsr tabs — the tab list */
   if (strcmp(argv[1], "tabs") == 0) return cmd_tabs();
 
-  /* ffsr go <N> <url> [w] — navigate tab N of the dedicated window.
+  /* ffsr go <N> <url> w — navigate tab N of the dedicated window.
    * 'w' = wait:interactive (the prompt comes back once the DOM is
    * ready); without 'w' = wait:none (immediate response). */
   if (strcmp(argv[1], "go") == 0) {
     if (argc < 4 || argc > 5) {
-      log_err("usage: ffsr go <N 0-9> <url> [w]");
+      log_err("usage: ffsr go <N 0-9> <url> w");
       return EXIT_BADARGS;
     }
     char *end = NULL;
@@ -1173,15 +1232,15 @@ int main(int argc, char **argv) {
     return EXIT_BADARGS;
   }
 
-/* ffsr get [html|txt|net|child|file] <N> [w] [-src]— Grouped core of extractions (HTML, visible text, network snapshot = same mechanism, only the expression changes; child = iframe loop; file = binary blob/source stream; con = console stream). RAW output. */
+/* ffsr get [html|txt|net|child|file] <N> w [src]— Grouped core of extractions (HTML, visible text, network snapshot = same mechanism, only the expression changes; child = iframe loop; file = binary blob/source stream; con = console stream). RAW output. */
   if (strcmp(argv[1], "get") == 0) {
-    if (argc < 3 || argc > 6) {
-      log_err("usage: ffsr get [html|txt|net|child|file] <N 0-9> [w] [-src]");
+    if (argc < 3 || argc > 7) {
+      log_err("usage: ffsr get [html|txt|net|child|file] <N 0-9> w [src] [js]");
       return EXIT_BADARGS;
     }
     const char *type = "html";
     const char *ns = argv[2];
-    int want_wait = 0, src = 0;
+    int want_wait = 0, src = 0, js = 0;
     if (argc == 4) {
       if (strcmp(argv[2], "w") == 0) {
         want_wait = 1;
@@ -1190,24 +1249,18 @@ int main(int argc, char **argv) {
         type = argv[2];
         ns = argv[3];
       }
-    } else if (argc == 5) {
+    } else {
       type = argv[2];
       ns = argv[3];
-      if (strcmp(argv[4], "w") == 0) want_wait = 1;
-      else if (strcmp(argv[4], "-src") == 0) src = 1;
-      else {
-        log_err("unknown 4th argument '%s' (expected: w|-src)", argv[4]);
-        return EXIT_BADARGS;
+      for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "w") == 0) want_wait = 1;
+        else if (strcmp(argv[i], "src") == 0) src = 1;
+        else if (strcmp(argv[i], "js") == 0) js = 1;
+        else {
+          log_err("unknown argument '%s' (expected: w|src|js)", argv[i]);
+          return EXIT_BADARGS;
+        }
       }
-    } else if (argc == 6) {
-      type = argv[2];
-      ns = argv[3];
-      if (strcmp(argv[4], "-src") != 0 || strcmp(argv[5], "w") != 0) {
-        log_err("usage: ffsr get file <N> -src w");
-        return EXIT_BADARGS;
-      }
-      src = 1;
-      want_wait = 1;
     }
     if (strcmp(type, "html") != 0 && strcmp(type, "txt") != 0 &&
         strcmp(type, "net") != 0 && strcmp(type, "child") != 0 &&
@@ -1217,7 +1270,7 @@ int main(int argc, char **argv) {
       return EXIT_BADARGS;
     }
     if (src && strcmp(type, "file") != 0) {
-      log_err("-src is only valid with `get file`");
+      log_err("src is only valid with `get file`");
       return EXIT_BADARGS;
     }
     char *end = NULL;
@@ -1226,12 +1279,12 @@ int main(int argc, char **argv) {
       log_err("N must be an integer between 0 and 9");
       return EXIT_BADARGS;
     }
-    if (strcmp(type, "file") == 0) return cmd_get_file((int)n, want_wait, src);
+    if (strcmp(type, "file") == 0) return cmd_get_file((int)n, want_wait, src, js);
     if (strcmp(type, "con") == 0) return cmd_get_con((int)n);
     return cmd_get(type, (int)n, want_wait);
   }
 
-  /* ffsr f5 <N> [w] — hard reload (cache bypass) of tab N */
+  /* ffsr f5 <N> w — hard reload (cache bypass) of tab N */
   if (strcmp(argv[1], "screen") == 0) {
     if (argc != 3) {
       log_err("usage: ffsr screen <N 0-9>");
@@ -1248,7 +1301,7 @@ int main(int argc, char **argv) {
 
   if (strcmp(argv[1], "f5") == 0) {
     if (argc < 3 || argc > 4) {
-      log_err("usage: ffsr f5 <N 0-9> [w]");
+      log_err("usage: ffsr f5 <N 0-9> w");
       return EXIT_BADARGS;
     }
     char *end = NULL;
