@@ -66,7 +66,7 @@ static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
 /* keepactive: rotate tab activation every KEEPACTIVE_S seconds */
-#define KEEPACTIVE_S 600
+#define KEEPACTIVE_S 300
 static int      g_keepactive_idx = 0;
 static time_t   g_keepactive_last = 0;
 
