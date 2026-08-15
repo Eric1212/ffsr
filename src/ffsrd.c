@@ -927,7 +927,7 @@ static void keepactive_inject(const char *ctx, int idx) {
     "    const end = (%d + 1) * 10 * sr;"
     "    for (let i = 0; i < len; i++) {"
     "      if (i >= start && i < end) {"
-    "        ch[i] = Math.sin(i / sr * 2 * Math.PI * 440) * 0.001;"
+    "        ch[i] = 0;"
     "      } else {"
     "        ch[i] = 0;"
     "      }"
