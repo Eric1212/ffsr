@@ -937,7 +937,7 @@ static void keepactive_inject(const char *ctx, int idx) {
     "    }, 1000);"
     "  } catch(e) {}"
     "})()";
-  char expression[512];
+  char expression[2048];
   snprintf(expression, sizeof(expression), "%s", js);
   Buf esc;
   buf_init(&esc);
