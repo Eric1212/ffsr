@@ -66,7 +66,7 @@ static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
 /* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
-#define KEEPACTIVE_S 100
+#define KEEPACTIVE_S 1
 static int      g_keepactive_idx = 0;
 static time_t   g_keepactive_last = 0;
 
@@ -928,10 +928,6 @@ static void keepactive_inject(const char *ctx, int idx) {
     "    gain.connect(ctx.destination);"
     "    osc.start();"
     "    window.__keepactive_ctx = ctx;"
-    "    setTimeout(function() {"
-    "      try { ctx.close(); } catch(e) {}"
-    "      window.__keepactive_ctx = null;"
-    "    }, 10000);"
     "  } catch(e) {}"
     "})()";
   char expression[512];
