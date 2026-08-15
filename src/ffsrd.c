@@ -917,7 +917,10 @@ static void keepactive_inject(const char *ctx, int idx) {
   (void)idx;
   const char *js =
     "(function() {"
-    "  if (window.__keepactive_ctx) return;"
+    "  if (window.__keepactive_ctx) {"
+    "    try { window.__keepactive_ctx.close(); } catch(e) {}"
+    "    window.__keepactive_ctx = null;"
+    "  }"
     "  try {"
     "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
     "    const osc = ctx.createOscillator();"
