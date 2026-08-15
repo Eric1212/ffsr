@@ -910,38 +910,32 @@ static void handle_window_client(int cfd) {
   close(cfd);
 }
 
-/* keepactive: inject a silent AudioContext heartbeat in tab idx, scheduled
- * in a 100s cycle: 10s of near-silent 440Hz tone at 1% volume per tab,
- * then silence. Prevents Firefox tab suspend without user-visible audio. */
+/* keepactive: inject a silent AudioContext heartbeat in tab idx
+ * 1000Hz tone at near-zero volume for 10s, then close.
+ * Prevents Firefox tab suspend without user-visible audio. */
 static void keepactive_inject(const char *ctx, int idx) {
+  (void)idx;
   const char *js =
     "(function() {"
     "  if (window.__keepactive_ctx) return;"
     "  try {"
     "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
-    "    const sr = ctx.sampleRate;"
-    "    const len = sr * 100;"
-    "    const buf = ctx.createBuffer(1, len, sr);"
-    "    const ch = buf.getChannelData(0);"
-    "    const start = %d * 10 * sr;"
-    "    const end = (%d + 1) * 10 * sr;"
-    "    for (let i = 0; i < len; i++) {"
-    "      if (i >= start && i < end) {"
-    "        ch[i] = 0;"
-    "      } else {"
-    "        ch[i] = 0;"
-    "      }"
-    "    }"
-    "    const src = ctx.createBufferSource();"
-    "    src.buffer = buf;"
-    "    src.loop = true;"
-    "    src.connect(ctx.destination);"
-    "    src.start(0);"
+    "    const osc = ctx.createOscillator();"
+    "    const gain = ctx.createGain();"
+    "    osc.frequency.value = 1000;"
+    "    gain.gain.value = 0.0001;"
+    "    osc.connect(gain);"
+    "    gain.connect(ctx.destination);"
+    "    osc.start();"
     "    window.__keepactive_ctx = ctx;"
+    "    setTimeout(function() {"
+    "      try { ctx.close(); } catch(e) {}"
+    "      window.__keepactive_ctx = null;"
+    "    }, 10000);"
     "  } catch(e) {}"
     "})()";
-  char expression[2048];
-  snprintf(expression, sizeof(expression), js, idx, idx);
+  char expression[512];
+  snprintf(expression, sizeof(expression), "%s", js);
   Buf esc;
   buf_init(&esc);
   json_escape(&esc, expression, strlen(expression));
