@@ -917,14 +917,9 @@ static void keepactive_inject(const char *ctx, int idx) {
   (void)idx;
   const char *js =
     "(function() {"
-    "  window.__keepactive_test = 1;"
-    "  if (window.__keepactive_ctx) {"
-    "    try { window.__keepactive_ctx.close(); } catch(e) {}"
-    "    window.__keepactive_ctx = null;"
-    "  }"
+    "  if (window.__keepactive_ctx) return;"
     "  try {"
     "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
-    "    if (ctx.state === 'suspended') ctx.resume();"
     "    const osc = ctx.createOscillator();"
     "    const gain = ctx.createGain();"
     "    osc.frequency.value = 1000;"
@@ -933,10 +928,6 @@ static void keepactive_inject(const char *ctx, int idx) {
     "    gain.connect(ctx.destination);"
     "    osc.start();"
     "    window.__keepactive_ctx = ctx;"
-    "    setTimeout(function() {"
-    "      try { ctx.close(); } catch(e) {}"
-    "      window.__keepactive_ctx = null;"
-    "    }, 1000);"
     "  } catch(e) {}"
     "})()";
   char expression[2048];
