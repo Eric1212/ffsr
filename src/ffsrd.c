@@ -911,18 +911,20 @@ static void handle_window_client(int cfd) {
 }
 
 /* keepactive: inject a 1s AudioContext heartbeat per tab every 1s
- * 22kHz tone, gain 1 — Firefox detects playback, tab stays alive.
+ * 1000Hz tone, gain 1 — Firefox detects playback, tab stays alive.
  * Each injection lasts 1s and auto-closes. */
 static void keepactive_inject(const char *ctx, int idx) {
   (void)idx;
   const char *js =
     "(function() {"
+    "  window.__keepactive_test = 1;"
     "  if (window.__keepactive_ctx) {"
     "    try { window.__keepactive_ctx.close(); } catch(e) {}"
     "    window.__keepactive_ctx = null;"
     "  }"
     "  try {"
     "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
+    "    if (ctx.state === 'suspended') ctx.resume();"
     "    const osc = ctx.createOscillator();"
     "    const gain = ctx.createGain();"
     "    osc.frequency.value = 1000;"
