@@ -65,8 +65,8 @@ static int      g_wsfd = -1;             /* active WS socket (select) */
 static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
-/* keepactive: rotate tab activation every KEEPACTIVE_S seconds */
-#define KEEPACTIVE_S 300
+/* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
+#define KEEPACTIVE_S 100
 static int      g_keepactive_idx = 0;
 static time_t   g_keepactive_last = 0;
 
@@ -910,6 +910,50 @@ static void handle_window_client(int cfd) {
   close(cfd);
 }
 
+/* keepactive: inject a silent AudioContext heartbeat in tab idx, scheduled
+ * in a 100s cycle: 10s of near-silent 440Hz tone at 1% volume per tab,
+ * then silence. Prevents Firefox tab suspend without user-visible audio. */
+static void keepactive_inject(const char *ctx, int idx) {
+  const char *js =
+    "(function() {"
+    "  if (window.__keepactive_ctx) return;"
+    "  try {"
+    "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
+    "    const sr = ctx.sampleRate;"
+    "    const len = sr * 100;"
+    "    const buf = ctx.createBuffer(1, len, sr);"
+    "    const ch = buf.getChannelData(0);"
+    "    const start = %d * 10 * sr;"
+    "    const end = (%d + 1) * 10 * sr;"
+    "    for (let i = 0; i < len; i++) {"
+    "      if (i >= start && i < end) {"
+    "        ch[i] = Math.sin(i / sr * 2 * Math.PI * 440) * 0.01;"
+    "      } else {"
+    "        ch[i] = 0;"
+    "      }"
+    "    }"
+    "    const src = ctx.createBufferSource();"
+    "    src.buffer = buf;"
+    "    src.loop = true;"
+    "    src.connect(ctx.destination);"
+    "    src.start(0);"
+    "    window.__keepactive_ctx = ctx;"
+    "  } catch(e) {}"
+    "})()";
+  char expression[2048];
+  snprintf(expression, sizeof(expression), js, idx, idx);
+  Buf esc;
+  buf_init(&esc);
+  json_escape(&esc, expression, strlen(expression));
+  char params[2048];
+  snprintf(params, sizeof(params),
+           "{\"expression\":\"%.*s\",\"target\":{\"context\":\"%.63s\"},"
+           "\"awaitPromise\":false,\"resultOwnership\":\"none\"}",
+           (int)esc.len, esc.data, ctx);
+  buf_free(&esc);
+  ws_command("script.evaluate", params);
+}
+
 /* ---------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
@@ -1000,15 +1044,11 @@ int main(int argc, char **argv) {
       }
     }
 
-    /* keepactive: ping tab activity to prevent Firefox tab suspend */
+    /* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
     if (g_nbtabs > 0 && now - g_keepactive_last > KEEPACTIVE_S) {
       if (g_keepactive_idx < g_nbtabs && g_tabs[g_keepactive_idx][0]) {
-        char params[256];
-        snprintf(params, sizeof(params),
-                 "{\"context\":\"%.63s\",\"expression\":\"document.readyState\"}",
-                 g_tabs[g_keepactive_idx]);
-        ws_command("script.evaluate", params);
-        log_msg("keepactive: evaluated tab %d (%s)",
+        keepactive_inject(g_tabs[g_keepactive_idx], g_keepactive_idx);
+        log_msg("keepactive: injected tab %d (%s)",
                 g_keepactive_idx, g_tabs[g_keepactive_idx]);
       }
       g_keepactive_idx = (g_keepactive_idx + 1) % MAX_TABS;
