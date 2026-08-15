@@ -1000,14 +1000,15 @@ int main(int argc, char **argv) {
       }
     }
 
-    /* keepactive: rotate tab activation every KEEPACTIVE_S seconds */
+    /* keepactive: ping tab activity to prevent Firefox tab suspend */
     if (g_nbtabs > 0 && now - g_keepactive_last > KEEPACTIVE_S) {
       if (g_keepactive_idx < g_nbtabs && g_tabs[g_keepactive_idx][0]) {
-        char params[160];
+        char params[256];
         snprintf(params, sizeof(params),
-                 "{\"context\":\"%.63s\"}", g_tabs[g_keepactive_idx]);
-        ws_command("browsingContext.activate", params);
-        log_msg("keepactive: activated tab %d (%s)",
+                 "{\"context\":\"%.63s\",\"expression\":\"document.readyState\"}",
+                 g_tabs[g_keepactive_idx]);
+        ws_command("script.evaluate", params);
+        log_msg("keepactive: evaluated tab %d (%s)",
                 g_keepactive_idx, g_tabs[g_keepactive_idx]);
       }
       g_keepactive_idx = (g_keepactive_idx + 1) % MAX_TABS;
