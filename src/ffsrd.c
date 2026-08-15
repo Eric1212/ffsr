@@ -66,7 +66,7 @@ static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
 /* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
-#define KEEPACTIVE_S 1
+#define KEEPACTIVE_S 100
 static int      g_keepactive_idx = 0;
 static time_t   g_keepactive_last = 0;
 
@@ -910,9 +910,9 @@ static void handle_window_client(int cfd) {
   close(cfd);
 }
 
-/* keepactive: inject a silent AudioContext heartbeat in tab idx
- * 40kHz tone at max volume for 10s, then close.
- * Prevents Firefox tab suspend. */
+/* keepactive: inject a 1s AudioContext heartbeat per tab every 1s
+ * 22kHz tone, gain 1 — Firefox detects playback, tab stays alive.
+ * Each injection lasts 1s and auto-closes. */
 static void keepactive_inject(const char *ctx, int idx) {
   (void)idx;
   const char *js =
@@ -922,12 +922,16 @@ static void keepactive_inject(const char *ctx, int idx) {
     "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
     "    const osc = ctx.createOscillator();"
     "    const gain = ctx.createGain();"
-    "    osc.frequency.value = 22000;"
+    "    osc.frequency.value = 1000;"
     "    gain.gain.value = 1;"
     "    osc.connect(gain);"
     "    gain.connect(ctx.destination);"
     "    osc.start();"
     "    window.__keepactive_ctx = ctx;"
+    "    setTimeout(function() {"
+    "      try { ctx.close(); } catch(e) {}"
+    "      window.__keepactive_ctx = null;"
+    "    }, 1000);"
     "  } catch(e) {}"
     "})()";
   char expression[512];
