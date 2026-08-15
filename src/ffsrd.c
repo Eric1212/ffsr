@@ -922,7 +922,7 @@ static void keepactive_inject(const char *ctx, int idx) {
     "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
     "    const osc = ctx.createOscillator();"
     "    const gain = ctx.createGain();"
-    "    osc.frequency.value = 40000;"
+    "    osc.frequency.value = 1;"
     "    gain.gain.value = 1;"
     "    osc.connect(gain);"
     "    gain.connect(ctx.destination);"
