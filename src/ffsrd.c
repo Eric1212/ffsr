@@ -910,38 +910,31 @@ static void handle_window_client(int cfd) {
   close(cfd);
 }
 
-/* keepactive: inject a silent HTMLAudioElement heartbeat in tab idx
- * 0.5s WAV silence blob looped at volume 0 — Firefox detects playback,
- * user hears nothing. Prevents tab suspend. */
+/* keepactive: inject a silent AudioContext heartbeat in tab idx
+ * 40kHz tone at max volume for 10s, then close.
+ * Prevents Firefox tab suspend. */
 static void keepactive_inject(const char *ctx, int idx) {
   (void)idx;
   const char *js =
     "(function() {"
-    "  if (window.__keepactive_audio) return;"
+    "  if (window.__keepactive_ctx) return;"
     "  try {"
-    "    const sr = 8000;"
-    "    const n = sr * 0.5;"
-    "    const buf = new ArrayBuffer(44 + n);"
-    "    const v = new DataView(buf);"
-    "    function ws(o,s){for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}"
-    "    ws(0,'RIFF'); v.setUint32(4,36+n,true);"
-    "    ws(8,'WAVE'); ws(12,'fmt ');"
-    "    v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);"
-    "    v.setUint32(24,sr,true); v.setUint32(28,sr,true);"
-    "    v.setUint16(32,1,true); v.setUint16(34,8,true);"
-    "    ws(36,'data'); v.setUint32(40,n,true);"
-    "    for(let i=0;i<n;i++) v.setUint8(44+i,128);"
-    "    const blob = new Blob([buf],{type:'audio/wav'});"
-    "    const url = URL.createObjectURL(blob);"
-    "    const audio = new Audio();"
-    "    audio.src = url;"
-    "    audio.loop = true;"
-    "    audio.volume = 0;"
-    "    audio.play();"
-    "    window.__keepactive_audio = audio;"
+    "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
+    "    const osc = ctx.createOscillator();"
+    "    const gain = ctx.createGain();"
+    "    osc.frequency.value = 40000;"
+    "    gain.gain.value = 1;"
+    "    osc.connect(gain);"
+    "    gain.connect(ctx.destination);"
+    "    osc.start();"
+    "    window.__keepactive_ctx = ctx;"
+    "    setTimeout(function() {"
+    "      try { ctx.close(); } catch(e) {}"
+    "      window.__keepactive_ctx = null;"
+    "    }, 10000);"
     "  } catch(e) {}"
     "})()";
-  char expression[2048];
+  char expression[512];
   snprintf(expression, sizeof(expression), "%s", js);
   Buf esc;
   buf_init(&esc);
