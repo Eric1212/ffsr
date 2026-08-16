@@ -65,10 +65,16 @@ static int      g_wsfd = -1;             /* active WS socket (select) */
 static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
-/* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
+/* keepactive: simulated user activation (Ctrl+numpad+ / Ctrl+numpad-)
+ * to prevent Firefox tab suspend. No audio, no visible zoom. */
 #define KEEPACTIVE_S 1
+#define KEEPACTIVE_LOG_S 20   /* summary log interval */
 static int      g_keepactive_idx = 0;
 static time_t   g_keepactive_next = 0;
+static int      g_keepactive_plus = 1;   /* 1 = Ctrl+, 0 = Ctrl- */
+static long     g_keepactive_count = 0;      /* activations since last log */
+static long     g_keepactive_plus_count = 0; /* of which Ctrl+ */
+static time_t   g_keepactive_log_next = 0;   /* next summary time */
 
 /* Route a complete WS message to its client (defined below, used by
  * ws_wait_daemon_response BEFORE its definition). */
@@ -910,38 +916,23 @@ static void handle_window_client(int cfd) {
   close(cfd);
 }
 
-/* keepactive: inject a 1s AudioContext heartbeat per tab every 1s
- * 1000Hz tone, gain 1 — Firefox detects playback, tab stays alive.
- * Each injection lasts 1s and auto-closes. */
-static void keepactive_inject(const char *ctx, int idx) {
-  (void)idx;
-  const char *js =
-    "(function() {"
-    "  if (window.__keepactive_ctx) return;"
-    "  try {"
-    "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
-    "    const osc = ctx.createOscillator();"
-    "    const gain = ctx.createGain();"
-    "    osc.frequency.value = 22000;"
-    "    gain.gain.value = 1;"
-    "    osc.connect(gain);"
-    "    gain.connect(ctx.destination);"
-    "    osc.start();"
-    "    window.__keepactive_ctx = ctx;"
-    "  } catch(e) {}"
-    "})()";
-  char expression[2048];
-  snprintf(expression, sizeof(expression), "%s", js);
-  Buf esc;
-  buf_init(&esc);
-  json_escape(&esc, expression, strlen(expression));
-  char params[2048];
+/* keepactive: simulated user activation via input.performActions.
+ * Sends Ctrl+numpad+ (plus) or Ctrl+numpad- (minus). Grants user
+ * activation (keeps the tab alive) WITHOUT audio and WITHOUT a visible
+ * zoom side-effect (Firefox doesn't apply the shortcut to these
+ * synthetic events). Fire-and-forget like the old audio injection.
+ * \uE009 = Ctrl, \uE025 = numpad+, \uE027 = numpad-. */
+static void keepactive_keystroke(const char *ctx, int plus) {
+  const char *key = plus ? "\\uE025" : "\\uE027";
+  char params[1024];
   snprintf(params, sizeof(params),
-           "{\"expression\":\"%.*s\",\"target\":{\"context\":\"%.63s\"},"
-           "\"awaitPromise\":false,\"resultOwnership\":\"none\"}",
-           (int)esc.len, esc.data, ctx);
-  buf_free(&esc);
-  ws_command("script.evaluate", params);
+           "{\"context\":\"%.63s\",\"actions\":[{\"type\":\"key\","
+           "\"id\":\"keyboard\",\"actions\":[{\"type\":\"keyDown\","
+           "\"value\":\"\\uE009\"},{\"type\":\"keyDown\",\"value\":\"%s\"},"
+           "{\"type\":\"keyUp\",\"value\":\"%s\"},"
+           "{\"type\":\"keyUp\",\"value\":\"\\uE009\"}]}]}",
+           ctx, key, key);
+  ws_command("input.performActions", params);
 }
 
 /* ---------------------------------------------------------------- main */
@@ -1016,8 +1007,17 @@ int main(int argc, char **argv) {
 
   while (!g_stop) {
     rfds = g_rd;
-    /* 10 s timeout: lets us reap idle clients (session limit 10 min) */
-    struct timeval tv = { 10, 0 };
+    /* 10 s default timeout (lets us reap idle clients — session limit
+     * 10 min), tightened to the next keepalive tick when one is pending
+     * so the 1 s-per-tab activation cadence is honored. */
+    long tv_ms = 10000;
+    time_t now0 = time(NULL);
+    if (g_nbtabs > 0 && g_keepactive_next > now0) {
+      long d = (long)(g_keepactive_next - now0) * 1000;
+      if (d < tv_ms) tv_ms = d;
+      if (tv_ms < 1) tv_ms = 1;
+    }
+    struct timeval tv = { tv_ms / 1000, (tv_ms % 1000) * 1000 };
     if (select(g_maxfd + 1, &rfds, NULL, NULL, &tv) < 0) {
       if (errno == EINTR) continue;
       log_err("select: %s", strerror(errno));
@@ -1034,15 +1034,32 @@ int main(int argc, char **argv) {
       }
     }
 
-    /* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
+    /* keepactive: simulated user activation (Ctrl+/Ctrl-) every 1 s,
+     * round-robin over the tabs; the +/- key flips at each full pass
+     * (every tab is activated once every ~10 s). */
     if (g_nbtabs > 0 && now >= g_keepactive_next) {
       if (g_keepactive_idx < g_nbtabs && g_tabs[g_keepactive_idx][0]) {
-        keepactive_inject(g_tabs[g_keepactive_idx], g_keepactive_idx);
-        log_msg("keepactive: injected tab %d (%s)",
-                g_keepactive_idx, g_tabs[g_keepactive_idx]);
+        keepactive_keystroke(g_tabs[g_keepactive_idx], g_keepactive_plus);
+        g_keepactive_count++;
+        if (g_keepactive_plus) g_keepactive_plus_count++;
+        if (g_keepactive_log_next == 0)
+          g_keepactive_log_next = now + KEEPACTIVE_LOG_S;
       }
-      g_keepactive_idx = (g_keepactive_idx + 1) % MAX_TABS;
+      int nxt = (g_keepactive_idx + 1) % g_nbtabs;
+      if (nxt == 0) g_keepactive_plus = !g_keepactive_plus;
+      g_keepactive_idx = nxt;
       g_keepactive_next = now + KEEPACTIVE_S;
+    }
+
+    /* keepactive summary: one log line every KEEPACTIVE_LOG_S instead of
+     * one per second. */
+    if (g_keepactive_count > 0 && now >= g_keepactive_log_next) {
+      log_msg("keepactive: %ld activations (%ld Ctrl+, %ld Ctrl-) over %ds",
+              g_keepactive_count, g_keepactive_plus_count,
+              g_keepactive_count - g_keepactive_plus_count, KEEPACTIVE_LOG_S);
+      g_keepactive_count = 0;
+      g_keepactive_plus_count = 0;
+      g_keepactive_log_next = now + KEEPACTIVE_LOG_S;
     }
 
     if (FD_ISSET(g_wsfd, &rfds)) ws_to_clients();
