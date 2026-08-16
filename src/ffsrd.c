@@ -66,7 +66,7 @@ static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
 /* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
-#define KEEPACTIVE_S 100
+#define KEEPACTIVE_S 1
 static int      g_keepactive_idx = 0;
 static time_t   g_keepactive_last = 0;
 
@@ -1016,8 +1016,9 @@ int main(int argc, char **argv) {
 
   while (!g_stop) {
     rfds = g_rd;
-    /* 10 s timeout: lets us reap idle clients (session limit 10 min) */
-    struct timeval tv = { 10, 0 };
+    /* Timeout: at most KEEPACTIVE_S to keep the loop responsive for keepactive.
+     * Also allows reaping idle clients (session limit 10 min). */
+    struct timeval tv = { KEEPACTIVE_S, 0 };
     if (select(g_maxfd + 1, &rfds, NULL, NULL, &tv) < 0) {
       if (errno == EINTR) continue;
       log_err("select: %s", strerror(errno));
