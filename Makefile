@@ -33,8 +33,6 @@ install: all
 	@echo "==> systemctl daemon-reload && systemctl enable --now ffsrd"
 	-systemctl daemon-reload
 	-systemctl enable ffsrd.service
-	# restart (not --now): an already active service keeps the OLD binary
-	# in memory — every make install must be effective immediately.
 	-systemctl restart ffsrd.service
 
 uninstall:
