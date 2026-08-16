@@ -68,7 +68,7 @@ static int      g_maxfd = -1;            /* high bound for select */
 /* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
 #define KEEPACTIVE_S 1
 static int      g_keepactive_idx = 0;
-static time_t   g_keepactive_last = 0;
+static time_t   g_keepactive_next = 0;
 
 /* Route a complete WS message to its client (defined below, used by
  * ws_wait_daemon_response BEFORE its definition). */
@@ -1016,9 +1016,8 @@ int main(int argc, char **argv) {
 
   while (!g_stop) {
     rfds = g_rd;
-    /* Timeout: at most KEEPACTIVE_S to keep the loop responsive for keepactive.
-     * Also allows reaping idle clients (session limit 10 min). */
-    struct timeval tv = { KEEPACTIVE_S, 0 };
+    /* 10 s timeout: lets us reap idle clients (session limit 10 min) */
+    struct timeval tv = { 10, 0 };
     if (select(g_maxfd + 1, &rfds, NULL, NULL, &tv) < 0) {
       if (errno == EINTR) continue;
       log_err("select: %s", strerror(errno));
@@ -1036,14 +1035,14 @@ int main(int argc, char **argv) {
     }
 
     /* keepactive: inject audio heartbeat to prevent Firefox tab suspend */
-    if (g_nbtabs > 0 && now - g_keepactive_last > KEEPACTIVE_S) {
+    if (g_nbtabs > 0 && now >= g_keepactive_next) {
       if (g_keepactive_idx < g_nbtabs && g_tabs[g_keepactive_idx][0]) {
         keepactive_inject(g_tabs[g_keepactive_idx], g_keepactive_idx);
         log_msg("keepactive: injected tab %d (%s)",
                 g_keepactive_idx, g_tabs[g_keepactive_idx]);
       }
       g_keepactive_idx = (g_keepactive_idx + 1) % MAX_TABS;
-      g_keepactive_last = now;
+      g_keepactive_next = now + KEEPACTIVE_S;
     }
 
     if (FD_ISSET(g_wsfd, &rfds)) ws_to_clients();
