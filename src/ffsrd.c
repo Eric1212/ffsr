@@ -65,25 +65,44 @@ static int      g_wsfd = -1;             /* active WS socket (select) */
 static fd_set   g_rd;                    /* watched fds (select) */
 static int      g_maxfd = -1;            /* high bound for select */
 
-/* keepactive: simulated user activation (Ctrl+numpad+ / Ctrl+numpad-)
- * to prevent Firefox tab suspend. No audio, no visible zoom. */
+/* keepactive: visible CSS zoom toggle (1.01 / 1) on each dedicated-window
+ * tab every 1 s — touches the rendered page to keep it alive. */
 #define KEEPACTIVE_S 1
 #define KEEPACTIVE_LOG_S 20   /* summary log interval */
 static int      g_keepactive_idx = 0;
 static time_t   g_keepactive_next = 0;
-static int      g_keepactive_plus = 1;   /* 1 = Ctrl+, 0 = Ctrl- */
+static int      g_keepactive_plus = 1;   /* 1 = zoom 1.01, 0 = zoom 1 */
 static long     g_keepactive_count = 0;      /* activations since last log */
-static long     g_keepactive_plus_count = 0; /* of which Ctrl+ */
+static long     g_keepactive_plus_count = 0; /* of which zoom 1.01 */
 static time_t   g_keepactive_log_next = 0;   /* next summary time */
 
 /* Route a complete WS message to its client (defined below, used by
  * ws_wait_daemon_response BEFORE its definition). */
 static void relay_message(const char *data, size_t len);
 
+/* THE exit pivot (defined below, used by ws_dead). */
+static void shutdown_daemon(int code) __attribute__((noreturn));
+
 /* curl / websocket */
 static CURL  *g_curl = NULL;
 static int    g_ws_alive = 0;            /* is the WS connection alive? */
 static Buf    g_wsbuf;                   /* fragments received before processing */
+
+/* THE transport-death verdict (2026-08-21): an EXPLICIT curl error on the
+ * WS (closure, RST, send failure) is unrecoverable — Firefox is gone or
+ * restarted. The daemon MUST exit(1): systemd (Restart=on-failure)
+ * relaunches a fresh ffsrd which re-takes possession when the bridge is
+ * back. A daemon living with a ghost WS accepts clients and answers
+ * nothing — the observed outage. CURLE_AGAIN / silence is NEVER death
+ * (idle persistence is a proven design). */
+static void ws_dead(const char *where, const char *detail)
+  __attribute__((noreturn));
+static void ws_dead(const char *where, const char *detail) {
+  g_ws_alive = 0;   /* pivot: shutdown_daemon will NOT attempt session.end */
+  log_err("WS DEAD (%s): %s — exiting for systemd restart", where,
+          detail ? detail : "transport error");
+  shutdown_daemon(EXIT_ERR);
+}
 
 /* Closes THE client connection (slot): close + FD_CLR + recompute g_maxfd.
  * ONLY client close point — a close without FD_CLR would leave a closed
@@ -303,6 +322,10 @@ static int ws_send(CURL *curl, const char *data, size_t len) {
   CURLcode rc = curl_ws_send(curl, data, len, &sent, 0, CURLWS_TEXT);
   if (rc != CURLE_OK) {
     log_err("curl_ws_send: %s", curl_easy_strerror(rc));
+    /* In service (session owned): an explicit send failure = dead
+     * transport = exit for restart. During startup (g_ws_alive still 0):
+     * benign failure, the caller retries within its startup budget. */
+    if (g_ws_alive) ws_dead("send", curl_easy_strerror(rc));
     return -1;
   }
   return (int)sent == (int)len ? 0 : -1;
@@ -365,9 +388,9 @@ static const char *ws_wait_daemon_response(int timeout_ms) {
     if (rc != CURLE_OK) {
       if (rc == CURLE_AGAIN) continue;
       log_err("curl_ws_recv (wait): %s", curl_easy_strerror(rc));
-      return NULL;
+      ws_dead("wait", curl_easy_strerror(rc));
     }
-    if (n == 0) continue;
+    if (n == 0) ws_dead("wait", "recv returned 0 bytes");
     buf_append(&g_wsbuf, buf, n);
     /* message incomplete as long as the frame has remaining bytes —
      * CURLWS_CONT is not enough: the FIRST fragment of a frame is not
@@ -419,6 +442,30 @@ static int ws_connect_firefox(void) {
   set_sock_buffers(g_wsfd);   /* heavy WS payloads must pass through */
   g_ws_alive = 1;   /* from here on: every error path must return the session */
   log_msg("WS connected to %s (fd %d)", WS_URL, g_wsfd);
+
+  /* THE probe (rule 2026-08-11): never create what you can inspect.
+   * ready:true → the bridge is free, we may session.new.
+   * ready:false → a session already exists (our own restart race or a
+   * zombie) → refuse to start cleanly, NEVER session.new. */
+  {
+    if (ws_command("session.status", "{}") != 0) return -1;
+    const char *st = ws_wait_daemon_response(HANDSHAKE_TO);
+    if (!st) { log_err("no session.status response"); return -1; }
+    long ready = 0;
+    int have = JSON_NOTFOUND;
+    /* "ready" lives INSIDE "result" — json_get is top-level only
+     * (nested objects are skipped), so we search within its bounds. */
+    size_t rsz = 0, rez = 0;
+    if (json_value_bounds(st, strlen(st), "result", &rsz, &rez) == 1)
+      have = json_get(st + rsz, rez - rsz, "ready", NULL, &ready);
+    free((void *)st);
+    if (have != JSON_NOTFOUND && !ready) {
+      log_err("session.status: bridge BUSY (session already started) — "
+              "not creating. If no ffsrd runs elsewhere: reboot Firefox.");
+      return -1;
+    }
+    log_msg("session.status: bridge free (ready=%ld)", ready);
+  }
 
   /* The only creation: session.new */
   log_msg("session.new sent");
@@ -583,11 +630,9 @@ static void ws_to_clients(void) {
     size_t n = sizeof(buf);
     CURLcode rc = curl_ws_recv(g_curl, buf, n, &n, &meta);
     if (rc == CURLE_AGAIN) return;           /* no more buffered fragments */
-    if (rc != CURLE_OK) {
-      log_err("curl_ws_recv: %s", curl_easy_strerror(rc));
-      return;
-    }
-    if (n == 0) return;
+    if (rc != CURLE_OK)
+      ws_dead("recv loop", curl_easy_strerror(rc));
+    if (n == 0) ws_dead("recv loop", "recv returned 0 bytes");
     if (meta && (meta->flags & CURLWS_PING)) {
       /* answer pong on the fly, relay nothing */
       size_t sent = 0;
@@ -616,8 +661,10 @@ static void shutdown_daemon(int code) {
     ws_command("session.end", "{}");
     /* Wait for Firefox to actually process session.end (not just send it).
      * Without this, the session stays locked and the next ffsrd gets
-     * "Maximum number of active sessions". */
-    const char *rep = ws_wait_daemon_response(10000);
+     * "Maximum number of active sessions". BOUNDED to 2 s (2026-08-21):
+     * a healthy bridge answers in ~50 ms; waiting 10 s on a dying WS
+     * was the observed hang of every stop/restart. */
+    const char *rep = ws_wait_daemon_response(2000);
     if (rep && strstr(rep, "\"type\":\"success\"") == NULL)
       log_msg("session.end response: %s", rep);
     free((void *)rep);
@@ -626,8 +673,12 @@ static void shutdown_daemon(int code) {
      * NB: this is NOT the forbidden ws.close (never WITHOUT session.end). */
     size_t sent = 0;
     curl_ws_send(g_curl, NULL, 0, &sent, 0, CURLWS_CLOSE);
-    sleep(10);
+    /* brief grace so the CLOSE frame flushes (was sleep(10): 20 s of
+     * cumulative hang per stop with the 10 s wait above). */
+    sleep(1);
     g_ws_alive = 0;
+  } else {
+    log_msg("shutdown — WS already dead, no session.end possible");
   }
   for (int i = 0; i < MAX_CLIENTS; i++) {
     if (clients[i].fd >= 0) close(clients[i].fd);
@@ -916,23 +967,22 @@ static void handle_window_client(int cfd) {
   close(cfd);
 }
 
-/* keepactive: simulated user activation via input.performActions.
- * Sends Ctrl+numpad+ (plus) or Ctrl+numpad- (minus). Grants user
- * activation (keeps the tab alive) WITHOUT audio and WITHOUT a visible
- * zoom side-effect (Firefox doesn't apply the shortcut to these
- * synthetic events). Fire-and-forget like the old audio injection.
- * \uE009 = Ctrl, \uE025 = numpad+, \uE027 = numpad-. */
-static void keepactive_keystroke(const char *ctx, int plus) {
-  const char *key = plus ? "\\uE025" : "\\uE027";
+/* keepactive: visible CSS zoom toggle via script.evaluate.
+ * Alternates document.documentElement.style.zoom between 1.01 (plus)
+ * and 1 (minus). Validated 2026-08-16: the zoom is really applied to
+ * the rendered page (getComputedStyle zoom=2, scrollSize changed) —
+ * unlike input.performActions (no visible effect) and
+ * browsingContext.setViewport (measurement-only override). Firefox
+ * supports the CSS zoom property since v126. Fire-and-forget. */
+static void keepactive_zoom(const char *ctx, int plus) {
+  const char *zoom = plus ? "1.01" : "1";
   char params[1024];
   snprintf(params, sizeof(params),
-           "{\"context\":\"%.63s\",\"actions\":[{\"type\":\"key\","
-           "\"id\":\"keyboard\",\"actions\":[{\"type\":\"keyDown\","
-           "\"value\":\"\\uE009\"},{\"type\":\"keyDown\",\"value\":\"%s\"},"
-           "{\"type\":\"keyUp\",\"value\":\"%s\"},"
-           "{\"type\":\"keyUp\",\"value\":\"\\uE009\"}]}]}",
-           ctx, key, key);
-  ws_command("input.performActions", params);
+           "{\"expression\":\"document.documentElement.style.zoom='%s'\","
+           "\"target\":{\"context\":\"%.63s\"},"
+           "\"awaitPromise\":false,\"resultOwnership\":\"none\"}",
+           zoom, ctx);
+  ws_command("script.evaluate", params);
 }
 
 /* ---------------------------------------------------------------- main */
@@ -972,11 +1022,26 @@ int main(int argc, char **argv) {
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
 
-  /* the session BEFORE listening: the daemon must be the owner */
-  if (ws_connect_firefox() != 0) {
-    /* ws_connect_firefox() already logged the specific error (zombie,
-     * bridge down, etc.). Just shutdown cleanly. */
-    shutdown_daemon(EXIT_ERR);
+  /* the session BEFORE listening: the daemon must be the owner.
+   * Startup budget (2026-08-21): the bridge may not be up yet (Firefox
+   * booting, or launched without the flag). Bounded patience ~60 s
+   * instead of a crash-restart loop every RestartSec; exhausted budget
+   * → exit(1), systemd takes over. */
+  {
+    int connected = -1;
+    for (int attempt = 0; attempt < 12 && !g_stop; attempt++) {
+      if (attempt > 0) {
+        log_msg("bridge not ready (attempt %d/12) — retry in 5 s", attempt);
+        sleep(5);
+      }
+      connected = ws_connect_firefox();
+      if (connected == 0) break;
+    }
+    if (connected != 0) {
+      /* ws_connect_firefox() already logged the specific error (zombie,
+       * bridge down, etc.). Just shutdown cleanly. */
+      shutdown_daemon(EXIT_ERR);
+    }
   }
 
   /* dedicated window BEFORE listening: reliability prerequisite #1 —
@@ -1034,12 +1099,12 @@ int main(int argc, char **argv) {
       }
     }
 
-    /* keepactive: simulated user activation (Ctrl+/Ctrl-) every 1 s,
-     * round-robin over the tabs; the +/- key flips at each full pass
-     * (every tab is activated once every ~10 s). */
+    /* keepactive: visible CSS zoom toggle (1.01 / 1) every 1 s,
+     * round-robin over the tabs; the zoom value flips at each full pass
+     * (every tab is toggled once every ~10 s). */
     if (g_nbtabs > 0 && now >= g_keepactive_next) {
       if (g_keepactive_idx < g_nbtabs && g_tabs[g_keepactive_idx][0]) {
-        keepactive_keystroke(g_tabs[g_keepactive_idx], g_keepactive_plus);
+        keepactive_zoom(g_tabs[g_keepactive_idx], g_keepactive_plus);
         g_keepactive_count++;
         if (g_keepactive_plus) g_keepactive_plus_count++;
         if (g_keepactive_log_next == 0)
@@ -1054,7 +1119,7 @@ int main(int argc, char **argv) {
     /* keepactive summary: one log line every KEEPACTIVE_LOG_S instead of
      * one per second. */
     if (g_keepactive_count > 0 && now >= g_keepactive_log_next) {
-      log_msg("keepactive: %ld activations (%ld Ctrl+, %ld Ctrl-) over %ds",
+      log_msg("keepactive: %ld toggles (%ld zoom 1.01, %ld zoom 1) over %ds",
               g_keepactive_count, g_keepactive_plus_count,
               g_keepactive_count - g_keepactive_plus_count, KEEPACTIVE_LOG_S);
       g_keepactive_count = 0;

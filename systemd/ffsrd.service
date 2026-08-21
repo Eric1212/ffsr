@@ -1,6 +1,12 @@
 [Unit]
 Description=ffsrd — FireFox Simple Relay daemon (WS bridge to 9222)
 Documentation=man:ffsr(1)
+# Rate limit (2026-08-21): the daemon has its own 60 s startup budget,
+# so a bridge down yields ~1 restart/min. Explicit bounds so a faster
+# failure loop can never silently reach the default burst (5/10s) and
+# leave the service dead without journal noise.
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 Type=simple
